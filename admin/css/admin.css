@@ -1,0 +1,95 @@
+/**
+ * Admin styles for Custom Migrator plugin
+ */
+
+.custom-migrator-section {
+    background: #fff;
+    border: 1px solid #ccd0d4;
+    box-shadow: 0 1px 1px rgba(0,0,0,.04);
+    margin-top: 20px;
+    padding: 20px;
+}
+
+.custom-migrator-section h2 {
+    margin-top: 0;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eee;
+}
+
+.custom-migrator-controls {
+    margin: 20px 0;
+}
+
+.custom-migrator-section table {
+    width: 100%;
+}
+
+.custom-migrator-section .notice-warning {
+    color: #e67e22;
+    font-weight: 500;
+}
+
+#export-status-text {
+    vertical-align: middle;
+    font-weight: 500;
+}
+
+#export-files-table .button {
+    margin-right: 5px;
+}
+
+#export-files-table .dashicons {
+    margin-right: 2px;
+}
+
+/* Progress Bar */
+.export-progress-bar {
+    height: 20px;
+    background-color: #f1f1f1;
+    border-radius: 4px;
+    margin: 10px 0;
+    overflow: hidden;
+}
+
+.export-progress-bar-inner {
+    background-color: #0073aa;
+    height: 100%;
+    width: 0;
+    transition: width 0.3s;
+}
+
+/* Added styles for improved UI */
+#export-log-preview {
+    background: #f9f9f9;
+    padding: 8px;
+    border-left: 3px solid #0073aa;
+    font-family: monospace;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-top: 10px;
+}
+
+.export-status-waiting {
+    color: #0073aa;
+}
+
+.export-status-error {
+    color: #dc3232;
+}
+
+.export-status-done {
+    color: #46b450;
+}
+
+/* Responsive improvements */
+@media screen and (max-width: 782px) {
+    .custom-migrator-section td,
+    .custom-migrator-section th {
+        display: block;
+        width: 100%;
+    }
+    
+    .custom-migrator-section th {
+        padding-bottom: 0;
+    }
+}
