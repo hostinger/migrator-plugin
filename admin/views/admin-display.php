@@ -25,6 +25,19 @@ if ( ! defined( 'WPINC' ) ) {
              '</p></div>';
     }
     
+    // Show S3 upload success/error message
+    if ( isset( $_GET['s3_upload'] ) ) {
+        if ( $_GET['s3_upload'] === 'success' ) {
+            echo '<div class="notice notice-success is-dismissible"><p>' . 
+                 esc_html__( 'Files successfully uploaded to S3.', 'custom-migrator' ) . 
+                 '</p></div>';
+        } elseif ( $_GET['s3_upload'] === 'error' ) {
+            echo '<div class="notice notice-error is-dismissible"><p>' . 
+                 esc_html__( 'Error uploading files to S3. Please check the export log for details.', 'custom-migrator' ) . 
+                 '</p></div>';
+        }
+    }
+    
     // Show error message if there was an export error
     $status_file = $export_dir . '/export-status.txt';
     if ( file_exists( $status_file ) ) {
@@ -37,9 +50,9 @@ if ( ! defined( 'WPINC' ) ) {
                  '</p>';
             
             // Add a link to download the log file if available
-            $log_file_path = $this->get_secure_log_file_path();
+            $log_file_path = $this->filesystem->get_log_file_path();
             if (file_exists($log_file_path)) {
-                $log_file_url = $this->get_secure_log_file_url();
+                $log_file_url = $this->filesystem->get_export_url() . '/' . basename($log_file_path);
                 echo '<p>' . 
                      sprintf( 
                          esc_html__( 'For more details, please check the %s.', 'custom-migrator' ),
@@ -183,6 +196,46 @@ if ( ! defined( 'WPINC' ) ) {
                 <?php endif; ?>
             </tbody>
         </table>
+        
+        <!-- S3 Upload Section -->
+        <?php if ($has_export && $current_status === 'done'): ?>
+        <div class="s3-upload-section">
+            <h3><?php esc_html_e('Upload to S3', 'custom-migrator'); ?></h3>
+            <p><?php esc_html_e('You can upload your export files to Amazon S3 using pre-signed URLs.', 'custom-migrator'); ?></p>
+            
+            <form method="post" id="s3-upload-form">
+                <?php wp_nonce_field('custom_migrator_s3_action', 'custom_migrator_s3_nonce'); ?>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Content File (.hstgr) URL', 'custom-migrator'); ?></th>
+                        <td>
+                            <input type="text" name="s3_url_hstgr" class="large-text" placeholder="https://your-bucket.s3.amazonaws.com/path/to/file?AWSAccessKeyId=...">
+                            <p class="description"><?php esc_html_e('Enter the pre-signed URL for the content (.hstgr) file.', 'custom-migrator'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Database File (.sql.gz) URL', 'custom-migrator'); ?></th>
+                        <td>
+                            <input type="text" name="s3_url_sql" class="large-text" placeholder="https://your-bucket.s3.amazonaws.com/path/to/file?AWSAccessKeyId=...">
+                            <p class="description"><?php esc_html_e('Enter the pre-signed URL for the database (.sql.gz) file.', 'custom-migrator'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Metadata File (.json) URL', 'custom-migrator'); ?></th>
+                        <td>
+                            <input type="text" name="s3_url_metadata" class="large-text" placeholder="https://your-bucket.s3.amazonaws.com/path/to/file?AWSAccessKeyId=...">
+                            <p class="description"><?php esc_html_e('Enter the pre-signed URL for the metadata (.json) file.', 'custom-migrator'); ?></p>
+                        </td>
+                    </tr>
+                </table>
+                <div id="s3-upload-status" style="margin-bottom: 15px; display: none;"></div>
+                <p class="submit">
+                    <input type="submit" name="upload_to_s3" id="upload-to-s3" class="button button-primary" value="<?php esc_attr_e('Upload to S3', 'custom-migrator'); ?>">
+                    <span class="spinner" id="s3-upload-spinner" style="float: none; margin-top: 4px;"></span>
+                </p>
+            </form>
+        </div>
+        <?php endif; ?>
         
         <div class="server-paths">
             <h3><?php esc_html_e( 'Server Paths', 'custom-migrator' ); ?></h3>
