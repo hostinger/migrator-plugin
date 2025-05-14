@@ -52,6 +52,7 @@ class Custom_Migrator_Core {
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-database.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-filesystem.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-metadata.php';
+        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-s3-uploader.php';
         
         // Initialize the filesystem class for use throughout the plugin
         $this->filesystem = new Custom_Migrator_Filesystem();
@@ -83,7 +84,109 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_start_export', array( $this, 'handle_start_export' ) );
         add_action( 'wp_ajax_cm_check_status', array( $this, 'handle_check_status' ) );
         add_action( 'wp_ajax_cm_run_export_now', array( $this, 'handle_run_export_now' ) );
+        add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
+        add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
+    }
+
+    /**
+     * Handle the AJAX request to check S3 upload status.
+     *
+     * @return void
+     */
+    public function handle_check_s3_status() {
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
+        $s3_status_file = WP_CONTENT_DIR . '/hostinger-migration-archives/s3-upload-status.txt';
+
+        if ( ! file_exists( $s3_status_file ) ) {
+            wp_send_json_error( array( 'status' => 'not_started' ) );
+        }
+
+        $status = trim( file_get_contents( $s3_status_file ) );
+        
+        if ( $status === 'done' ) {
+            wp_send_json_success( array(
+                'status' => 'done',
+                'message' => 'S3 upload completed successfully'
+            ) );
+        } elseif (strpos($status, 'error:') === 0) {
+            // Return error status
+            wp_send_json_error(array(
+                'status' => 'error',
+                'message' => substr($status, 6) // Remove 'error:' prefix
+            ));
+        } else {
+            // Get current file being uploaded if it's in the format "uploading_filetype"
+            $current_file = '';
+            if (strpos($status, 'uploading_') === 0) {
+                $current_file = substr($status, 10); // Remove 'uploading_' prefix
+            }
+            
+            wp_send_json_success( array( 
+                'status' => $status,
+                'current_file' => $current_file,
+                'message' => 'Upload in progress' . ($current_file ? ': ' . $current_file : '')
+            ));
+        }
+    }
+
+    /**
+     * Handle S3 upload request.
+     *
+     * @return void
+     */
+    public function handle_upload_to_s3() {
+        // Try to increase PHP execution time limit
+        @set_time_limit(0);  // Try to remove the time limit
+        @ini_set('max_execution_time', 3600); // Try to set to 1 hour
+    
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+        
+        // Check if export is done
+        $status_file = $this->filesystem->get_status_file_path();
+        if ( ! file_exists( $status_file ) || trim( file_get_contents( $status_file ) ) !== 'done' ) {
+            wp_send_json_error( array( 'message' => 'Export is not complete. Please wait for export to finish before uploading to S3.' ) );
+            return;
+        }
+        
+        // Get pre-signed URLs
+        $s3_urls = array(
+            'hstgr'    => isset( $_POST['s3_url_hstgr'] ) ? sanitize_text_field( $_POST['s3_url_hstgr'] ) : '',
+            'sql'      => isset( $_POST['s3_url_sql'] ) ? sanitize_text_field( $_POST['s3_url_sql'] ) : '',
+            'metadata' => isset( $_POST['s3_url_metadata'] ) ? sanitize_text_field( $_POST['s3_url_metadata'] ) : '',
+        );
+        
+        // Check if at least one URL is provided
+        if ( empty( $s3_urls['hstgr'] ) && empty( $s3_urls['sql'] ) && empty( $s3_urls['metadata'] ) ) {
+            wp_send_json_error( array( 'message' => 'Please provide at least one pre-signed URL for upload.' ) );
+            return;
+        }
+        
+        // Initialize S3 uploader
+        $s3_uploader = new Custom_Migrator_S3_Uploader();
+        
+        // Upload files to S3
+        $result = $s3_uploader->upload_to_s3( $s3_urls );
+        
+        if ( $result['success'] ) {
+            wp_send_json_success( array( 
+                'message' => 'Files uploaded successfully to S3.',
+                'details' => $result['messages'],
+                'uploaded_files' => $result['uploaded']
+            ) );
+        } else {
+            wp_send_json_error( array( 
+                'message' => 'Error uploading files to S3. Please check the export log for details.',
+                'details' => $result['messages']
+            ) );
+        }
     }
 
     /**

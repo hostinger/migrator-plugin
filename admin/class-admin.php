@@ -74,6 +74,46 @@ class Custom_Migrator_Admin {
             wp_redirect( add_query_arg( 'export_started', '1', CUSTOM_MIGRATOR_ADMIN_URL ) );
             exit;
         }
+        
+        // Check if S3 upload form was submitted
+        if ( isset( $_POST['upload_to_s3'] ) && isset( $_POST['custom_migrator_s3_nonce'] ) ) {
+            // Verify nonce
+            if ( ! wp_verify_nonce( $_POST['custom_migrator_s3_nonce'], 'custom_migrator_s3_action' ) ) {
+                wp_die( 'Security check failed' );
+            }
+            
+            // Check user permissions
+            if ( ! current_user_can( 'manage_options' ) ) {
+                wp_die( 'You do not have sufficient permissions to perform this action' );
+            }
+            
+            // Get pre-signed URLs
+            $s3_urls = array(
+                'hstgr'    => sanitize_text_field( $_POST['s3_url_hstgr'] ),
+                'sql'      => sanitize_text_field( $_POST['s3_url_sql'] ),
+                'metadata' => sanitize_text_field( $_POST['s3_url_metadata'] ),
+            );
+            
+            // Check if at least one URL is provided
+            if ( empty( $s3_urls['hstgr'] ) && empty( $s3_urls['sql'] ) && empty( $s3_urls['metadata'] ) ) {
+                wp_die( 'Please provide at least one pre-signed URL for upload.' );
+            }
+            
+            // Initialize S3 uploader
+            require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-s3-uploader.php';
+            $s3_uploader = new Custom_Migrator_S3_Uploader();
+            
+            // Upload files to S3
+            $result = $s3_uploader->upload_to_s3( $s3_urls );
+            
+            // Redirect based on result
+            if ( $result['success'] ) {
+                wp_redirect( add_query_arg( 's3_upload', 'success', CUSTOM_MIGRATOR_ADMIN_URL ) );
+            } else {
+                wp_redirect( add_query_arg( 's3_upload', 'error', CUSTOM_MIGRATOR_ADMIN_URL ) );
+            }
+            exit;
+        }
     }
 
     /**
@@ -184,6 +224,13 @@ class Custom_Migrator_Admin {
                     'size' => $this->filesystem->format_file_size( filesize( $file_paths['log'] ) ),
                 );
             }
+        }
+        
+        // Get status for determining if export is done
+        $current_status = '';
+        $status_file = $this->filesystem->get_status_file_path();
+        if ( file_exists( $status_file ) ) {
+            $current_status = trim( file_get_contents( $status_file ) );
         }
         
         // Get system information
