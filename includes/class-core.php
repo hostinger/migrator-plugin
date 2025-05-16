@@ -272,6 +272,12 @@ class Custom_Migrator_Core {
             @unlink($status_file);
         }
         
+        // Clean up resume info file if it exists
+        $resume_info_file = $export_dir . '/export-resume-info.json';
+        if (file_exists($resume_info_file)) {
+            @unlink($resume_info_file);
+        }
+        
         // Clean up export files if they exist
         $file_paths = $this->filesystem->get_export_file_paths();
         foreach ($file_paths as $path) {
@@ -344,6 +350,41 @@ class Custom_Migrator_Core {
                 'log'             => $file_urls['log'],
                 'file_info'       => $file_info,
             ) );
+        } elseif ($status === 'paused') {
+            // Get resume information 
+            $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+            $resume_info = file_exists($resume_info_file) ? json_decode(file_get_contents($resume_info_file), true) : array();
+            
+            $files_processed = isset($resume_info['files_processed']) ? (int)$resume_info['files_processed'] : 0;
+            $bytes_processed = isset($resume_info['bytes_processed']) ? (int)$resume_info['bytes_processed'] : 0;
+            
+            // Get log for more details
+            $log_file = $this->filesystem->get_log_file_path();
+            $recent_log = '';
+            
+            if (file_exists($log_file)) {
+                $log_content = file_get_contents($log_file);
+                $log_lines = explode("\n", $log_content);
+                $recent_log = implode("\n", array_slice($log_lines, -5)); // Get last 5 lines
+            }
+            
+            // Force cron to run if it hasn't yet
+            $this->maybe_trigger_cron();
+            
+            wp_send_json_success(array( 
+                'status' => 'paused_resuming',
+                'message' => sprintf(
+                    'Export is paused after processing %d files (%.2f MB) and will resume automatically', 
+                    $files_processed, 
+                    $bytes_processed / (1024 * 1024)
+                ),
+                'recent_log' => $recent_log,
+                'progress' => array(
+                    'files_processed' => $files_processed,
+                    'bytes_processed' => $this->filesystem->format_file_size($bytes_processed),
+                    'last_update' => isset($resume_info['last_update']) ? date('Y-m-d H:i:s', $resume_info['last_update']) : ''
+                )
+            ));
         } elseif (strpos($status, 'error:') === 0) {
             // Return error status
             wp_send_json_error(array(
@@ -355,10 +396,10 @@ class Custom_Migrator_Core {
             $log_file = $this->filesystem->get_log_file_path();
             $recent_log = '';
             
-            if ( file_exists( $log_file ) ) {
-                $log_content = file_get_contents( $log_file );
-                $log_lines = explode( "\n", $log_content );
-                $recent_log = implode( "\n", array_slice( $log_lines, -5 ) ); // Get last 5 lines
+            if (file_exists($log_file)) {
+                $log_content = file_get_contents($log_file);
+                $log_lines = explode("\n", $log_content);
+                $recent_log = implode("\n", array_slice($log_lines, -5)); // Get last 5 lines
             }
             
             // Check if we need to trigger cron manually
@@ -367,7 +408,7 @@ class Custom_Migrator_Core {
                 $this->maybe_trigger_cron();
             }
             
-            wp_send_json_success( array( 
+            wp_send_json_success(array( 
                 'status' => $status,
                 'recent_log' => $recent_log
             ));
@@ -434,35 +475,44 @@ class Custom_Migrator_Core {
      */
     public function run_export() {
         // Set time limit to unlimited if possible
-        if ( ! ini_get( 'safe_mode' ) ) {
-            set_time_limit( 0 );
+        if (!ini_get('safe_mode')) {
+            set_time_limit(0);
         }
 
         // Increase memory limit if possible
         $this->increase_memory_limit();
 
         try {
-            // Update status to confirm we're running
-            $this->filesystem->write_status('exporting');
-            $this->filesystem->log('Export process is running');
+            // Check if we are resuming a paused export
+            $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+            $is_resume = file_exists($resume_info_file);
+            
+            if ($is_resume) {
+                $this->filesystem->write_status('resuming');
+                $this->filesystem->log('Resuming export process');
+            } else {
+                // Update status to confirm we're running
+                $this->filesystem->write_status('exporting');
+                $this->filesystem->log('Export process is running');
+            }
             
             // Run the export
             $exporter = new Custom_Migrator_Exporter();
             $result = $exporter->export();
             
             if (!$result) {
-                $this->filesystem->write_status( 'error: Export failed to complete successfully' );
-                $this->filesystem->log( 'Export failed to complete successfully' );
+                $this->filesystem->write_status('error: Export failed to complete successfully');
+                $this->filesystem->log('Export failed to complete successfully');
             }
         } catch (Exception $e) {
             // Log the error and update the status
             $error_message = 'Export failed with error: ' . $e->getMessage();
-            $this->filesystem->write_status( 'error: ' . $error_message );
-            $this->filesystem->log( $error_message );
+            $this->filesystem->write_status('error: ' . $error_message);
+            $this->filesystem->log($error_message);
             
             // Add additional debugging information if possible
             if (defined('WP_DEBUG') && WP_DEBUG) {
-                $this->filesystem->log( 'Error trace: ' . $e->getTraceAsString() );
+                $this->filesystem->log('Error trace: ' . $e->getTraceAsString());
             }
         }
     }
@@ -473,12 +523,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function increase_memory_limit() {
-        $current_limit = ini_get( 'memory_limit' );
-        $current_limit_int = $this->return_bytes( $current_limit );
+        $current_limit = ini_get('memory_limit');
+        $current_limit_int = $this->return_bytes($current_limit);
         
         // Try to increase to 512M if current limit is lower
-        if ( $current_limit_int < 536870912 ) {
-            @ini_set( 'memory_limit', '512M' );
+        if ($current_limit_int < 536870912) {
+            @ini_set('memory_limit', '512M');
         }
     }
 
@@ -488,12 +538,12 @@ class Custom_Migrator_Core {
      * @param string $size_str Memory limit string like '256M'.
      * @return int Size in bytes.
      */
-    private function return_bytes( $size_str ) {
-        $size_str = trim( $size_str );
-        $unit = strtolower( substr( $size_str, -1 ) );
-        $size = (int) $size_str;
+    private function return_bytes($size_str) {
+        $size_str = trim($size_str);
+        $unit = strtolower(substr($size_str, -1));
+        $size = (int)$size_str;
         
-        switch ( $unit ) {
+        switch ($unit) {
             case 'g':
                 $size *= 1024;
                 // Fall through
@@ -513,9 +563,9 @@ class Custom_Migrator_Core {
      * @param array $links Plugin action links.
      * @return array Modified plugin action links.
      */
-    public function add_settings_link( $links ) {
-        $settings_link = '<a href="' . CUSTOM_MIGRATOR_ADMIN_URL . '">' . __( 'Export Site', 'custom-migrator' ) . '</a>';
-        array_unshift( $links, $settings_link );
+    public function add_settings_link($links) {
+        $settings_link = '<a href="' . CUSTOM_MIGRATOR_ADMIN_URL . '">' . __('Export Site', 'custom-migrator') . '</a>';
+        array_unshift($links, $settings_link);
         return $links;
     }
 
@@ -525,7 +575,7 @@ class Custom_Migrator_Core {
      * @return Custom_Migrator_Core The singleton instance.
      */
     public static function get_instance() {
-        if ( null === self::$instance ) {
+        if (null === self::$instance) {
             self::$instance = new self();
         }
         return self::$instance;
