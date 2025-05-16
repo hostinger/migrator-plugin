@@ -160,19 +160,36 @@ jQuery(document).ready(function($) {
                 success: function(response) {
                     if (response.success) {
                         var status = response.data.status;
-                        $("#export-status-text").text(capitalizeFirstLetter(status) + "...");
                         
-                        if (status === 'done') {
+                        if (status === 'paused_resuming') {
+                            // Display paused status with progress info
+                            var progressInfo = response.data.progress;
+                            var statusMessage = "Export paused after processing " + 
+                                progressInfo.files_processed + " files (" + 
+                                progressInfo.bytes_processed + "). Resuming automatically...";
+                            
+                            $("#export-status-text").text(statusMessage);
+                            
+                            // Optionally add a progress bar
+                            $(".export-progress-bar").show();
+                            
+                            // Update log if available
+                            if (response.data.recent_log) {
+                                $("#export-log-preview").text(response.data.recent_log).show();
+                            }
+                        } else if (status === 'done') {
                             clearInterval(statusInterval);
                             window.location.reload();
-                        }
-                        
-                        // Update progress log if available
-                        if (response.data.recent_log) {
-                            var logLines = response.data.recent_log.split("\n");
-                            var latestLog = logLines[logLines.length - 1];
-                            if (latestLog) {
-                                $("#export-log-preview").text(latestLog).show();
+                        } else {
+                            $("#export-status-text").text(capitalizeFirstLetter(status) + "...");
+                            
+                            // Update progress log if available
+                            if (response.data.recent_log) {
+                                var logLines = response.data.recent_log.split("\n");
+                                var latestLog = logLines[logLines.length - 1];
+                                if (latestLog) {
+                                    $("#export-log-preview").text(latestLog).show();
+                                }
                             }
                         }
                     } else {

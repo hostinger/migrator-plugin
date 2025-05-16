@@ -111,6 +111,22 @@
     margin-left: 10px;
 }
 
+/* Resume progress styling */
+.resume-progress-info {
+    background: #f7fcff;
+    border-left: 4px solid #0073aa;
+    padding: 10px 15px;
+    margin: 10px 0;
+}
+
+.resume-progress-info p {
+    margin: 5px 0;
+}
+
+.resume-progress-info strong {
+    font-weight: 600;
+}
+
 /* Responsive improvements */
 @media screen and (max-width: 782px) {
     .custom-migrator-section td,
