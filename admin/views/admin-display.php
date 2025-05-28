@@ -52,13 +52,16 @@ if ( ! defined( 'WPINC' ) ) {
             // Add a link to download the log file if available
             $log_file_path = $this->filesystem->get_log_file_path();
             if (file_exists($log_file_path)) {
-                $log_file_url = $this->filesystem->get_export_url() . '/' . basename($log_file_path);
-                echo '<p>' . 
-                     sprintf( 
-                         esc_html__( 'For more details, please check the %s.', 'custom-migrator' ),
-                         '<a href="' . esc_url($log_file_url) . '" download>' . esc_html__('export log', 'custom-migrator') . '</a>'
-                     ) . 
-                     '</p>';
+                $log_file_urls = $this->filesystem->get_export_file_urls();
+                $log_file_url = isset($log_file_urls['log']) ? $log_file_urls['log'] : '';
+                if ($log_file_url) {
+                    echo '<p>' . 
+                         sprintf( 
+                             esc_html__( 'For more details, please check the %s.', 'custom-migrator' ),
+                             '<a href="' . esc_url($log_file_url) . '" download>' . esc_html__('export log', 'custom-migrator') . '</a>'
+                         ) . 
+                         '</p>';
+                }
             }
             
             echo '</div>';

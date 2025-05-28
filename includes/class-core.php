@@ -36,6 +36,7 @@ class Custom_Migrator_Core {
         $this->load_dependencies();
         $this->define_admin_hooks();
         $this->define_ajax_hooks();
+        $this->define_cron_hooks();
     }
 
     /**
@@ -87,6 +88,109 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
         add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
+    }
+
+    /**
+     * Define cron-related hooks with improved monitoring.
+     *
+     * @return void
+     */
+    private function define_cron_hooks() {
+        add_action( 'cm_run_export', array( $this, 'run_export' ) );
+        add_action( 'cm_monitor_export', array( $this, 'monitor_export_progress' ) );
+        add_action( 'cm_run_export_direct', array( $this, 'run_export_directly' ) );
+        
+        // Schedule monitoring if not already scheduled
+        if (!wp_next_scheduled('cm_monitor_export')) {
+            wp_schedule_event(time(), 'hourly', 'cm_monitor_export');
+        }
+    }
+
+    /**
+     * Monitor export progress and detect stuck processes.
+     *
+     * @return void
+     */
+    public function monitor_export_progress() {
+        $status_file = $this->filesystem->get_status_file_path();
+        
+        if (!file_exists($status_file)) {
+            return; // No export in progress
+        }
+        
+        $status = trim(file_get_contents($status_file));
+        $modified_time = filemtime($status_file);
+        $current_time = time();
+        
+        // Check for stuck exports
+        $stuck_statuses = ['starting', 'exporting', 'resuming'];
+        $time_diff = $current_time - $modified_time;
+        
+        if (in_array($status, $stuck_statuses) && $time_diff > 600) { // 10 minutes
+            $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds. Attempting recovery.");
+            
+            // Try to restart the export
+            $this->force_export_restart();
+        }
+        
+        // Clean up old monitoring if export is done
+        if ($status === 'done' || strpos($status, 'error:') === 0) {
+            wp_clear_scheduled_hook('cm_monitor_export');
+        }
+    }
+
+    /**
+     * Force restart a stuck export.
+     *
+     * @return void
+     */
+    private function force_export_restart() {
+        // Clear any existing scheduled events
+        wp_clear_scheduled_hook('cm_run_export');
+        
+        // Update status to indicate restart
+        $this->filesystem->write_status('restarting');
+        $this->filesystem->log('Forcing export restart due to stuck process');
+        
+        // Schedule immediate restart
+        wp_schedule_single_event(time() + 5, 'cm_run_export');
+        
+        // Force cron to run
+        $this->trigger_cron_execution();
+    }
+
+    /**
+     * Improved cron triggering with multiple fallback methods.
+     *
+     * @return void
+     */
+    private function trigger_cron_execution() {
+        // Method 1: Standard WordPress spawn_cron
+        if (function_exists('spawn_cron')) {
+            spawn_cron();
+            $this->filesystem->log('Triggered cron via spawn_cron()');
+        }
+        
+        // Method 2: Direct HTTP request to wp-cron.php
+        $cron_url = site_url('wp-cron.php');
+        $this->non_blocking_request($cron_url . '?doing_wp_cron=1');
+        $this->filesystem->log('Triggered cron via HTTP request');
+        
+        // Method 3: If cron is disabled, try direct execution
+        if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
+            $this->filesystem->log('WP_CRON disabled, scheduling direct execution');
+            wp_schedule_single_event(time() + 2, 'cm_run_export_direct');
+        }
+    }
+
+    /**
+     * Direct export execution for environments with disabled cron.
+     *
+     * @return void
+     */
+    public function run_export_directly() {
+        $this->filesystem->log('Running export directly (cron disabled)');
+        $this->run_export();
     }
 
     /**
@@ -242,7 +346,12 @@ class Custom_Migrator_Core {
 
         // Schedule for immediate execution and ensure WP Cron runs
         wp_schedule_single_event(time(), 'cm_run_export');
-        spawn_cron(); // Force cron to run immediately
+        
+        // Start monitoring
+        wp_clear_scheduled_hook('cm_monitor_export');
+        wp_schedule_event(time() + 300, 'hourly', 'cm_monitor_export'); // Start monitoring after 5 minutes
+        
+        $this->trigger_cron_execution();
 
         $wp_content_size = $this->filesystem->get_directory_size( WP_CONTENT_DIR );
         wp_send_json_success(array(
@@ -253,10 +362,13 @@ class Custom_Migrator_Core {
 
     /**
      * Clean up any existing export files and processes.
+     *
+     * @return void
      */
     private function cleanup_existing_export() {
         // Clear any pending scheduled events
         wp_clear_scheduled_hook('cm_run_export');
+        wp_clear_scheduled_hook('cm_monitor_export');
         
         // Get export directory and files
         $export_dir = $this->filesystem->get_export_dir();
@@ -309,21 +421,26 @@ class Custom_Migrator_Core {
         }
 
         $status = trim( file_get_contents( $status_file ) );
+        $modified_time = filemtime($status_file);
+        $current_time = time();
+        $time_diff = $current_time - $modified_time;
         
-        // Check if export process is stuck in "starting" state
-        if ($status === 'starting') {
-            $modified_time = filemtime($status_file);
-            $current_time = time();
-            
-            // If status has been "starting" for more than 2 minutes, consider it stuck
-            if (($current_time - $modified_time) > 120) {
-                $this->filesystem->write_status('error: Export process appears to be stuck. Please try again.');
-                $this->filesystem->log('Export process was stuck in "starting" state for too long. Marked as error.');
+        // Enhanced stuck detection
+        if (in_array($status, ['starting', 'exporting', 'resuming'])) {
+            if ($time_diff > 300) { // 5 minutes for starting
+                $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
-                wp_send_json_error(array(
-                    'status' => 'error',
-                    'message' => 'Export process appears to be stuck. Please try again.'
+                // Try to restart if really stuck
+                if ($time_diff > 600) { // 10 minutes
+                    $this->force_export_restart();
+                }
+                
+                wp_send_json_success(array(
+                    'status' => $status . '_stuck',
+                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Attempting recovery...",
+                    'time_since_update' => $time_diff
                 ));
+                return;
             }
         }
         
@@ -341,6 +458,9 @@ class Custom_Migrator_Core {
                     );
                 }
             }
+            
+            // Clean up monitoring when done
+            wp_clear_scheduled_hook('cm_monitor_export');
             
             wp_send_json_success( array(
                 'status'          => 'done',
@@ -368,8 +488,11 @@ class Custom_Migrator_Core {
                 $recent_log = implode("\n", array_slice($log_lines, -5)); // Get last 5 lines
             }
             
-            // Force cron to run if it hasn't yet
-            $this->maybe_trigger_cron();
+            // Ensure resume is scheduled
+            if (!wp_next_scheduled('cm_run_export')) {
+                wp_schedule_single_event(time() + 5, 'cm_run_export');
+                $this->trigger_cron_execution();
+            }
             
             wp_send_json_success(array( 
                 'status' => 'paused_resuming',
@@ -387,6 +510,7 @@ class Custom_Migrator_Core {
             ));
         } elseif (strpos($status, 'error:') === 0) {
             // Return error status
+            wp_clear_scheduled_hook('cm_monitor_export');
             wp_send_json_error(array(
                 'status' => 'error',
                 'message' => substr($status, 6) // Remove 'error:' prefix
@@ -399,70 +523,30 @@ class Custom_Migrator_Core {
             if (file_exists($log_file)) {
                 $log_content = file_get_contents($log_file);
                 $log_lines = explode("\n", $log_content);
-                $recent_log = implode("\n", array_slice($log_lines, -5)); // Get last 5 lines
-            }
-            
-            // Check if we need to trigger cron manually
-            if ($status === 'starting') {
-                // Force cron to run if it hasn't yet
-                $this->maybe_trigger_cron();
+                $recent_log = implode("\n", array_slice($log_lines, -3)); // Get last 3 lines
             }
             
             wp_send_json_success(array( 
                 'status' => $status,
-                'recent_log' => $recent_log
+                'recent_log' => $recent_log,
+                'time_since_update' => $time_diff
             ));
         }
     }
 
     /**
-     * Check if cron needs to be triggered and do so if needed.
-     */
-    private function maybe_trigger_cron() {
-        // If cron is disabled or not functioning, we should restart the export
-        if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
-            $this->filesystem->log("WP Cron is disabled, attempting direct export");
-            
-            // Check if it's been more than 30 seconds since starting
-            $status_file = $this->filesystem->get_status_file_path();
-            if (file_exists($status_file)) {
-                $modified_time = filemtime($status_file);
-                $current_time = time();
-                
-                // If it's been more than 30 seconds, try to start the export directly
-                if (($current_time - $modified_time) > 30) {
-                    // Start a non-blocking request to run the export
-                    $admin_url = admin_url('admin-ajax.php');
-                    $nonce = wp_create_nonce('custom_migrator_nonce');
-                    $url = add_query_arg(array(
-                        'action' => 'cm_run_export_now',
-                        'nonce' => $nonce
-                    ), $admin_url);
-                    
-                    // Make a non-blocking request
-                    $this->non_blocking_request($url);
-                    
-                    $this->filesystem->log("Triggered direct export via AJAX");
-                }
-            }
-        } else {
-            // Attempt to spawn cron
-            spawn_cron();
-            $this->filesystem->log("Manually triggered WP Cron");
-        }
-    }
-    
-    /**
      * Make a non-blocking HTTP request to a URL.
      * 
      * @param string $url The URL to request
+     * @return void
      */
     private function non_blocking_request($url) {
         // Non-blocking request
         $args = array(
             'timeout'   => 0.01,
             'blocking'  => false,
-            'sslverify' => apply_filters('https_local_ssl_verify', false)
+            'sslverify' => apply_filters('https_local_ssl_verify', false),
+            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url()
         );
         
         wp_remote_get($url, $args);
@@ -474,13 +558,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     public function run_export() {
-        // Set time limit to unlimited if possible
-        if (!ini_get('safe_mode')) {
-            set_time_limit(0);
-        }
-
-        // Increase memory limit if possible
-        $this->increase_memory_limit();
+        // Detect execution environment
+        $is_background = $this->is_background_execution();
+        $this->filesystem->log('Export execution started (background: ' . ($is_background ? 'yes' : 'no') . ')');
+        
+        // Set execution environment
+        $this->setup_execution_environment();
 
         try {
             // Check if we are resuming a paused export
@@ -495,6 +578,9 @@ class Custom_Migrator_Core {
                 $this->filesystem->write_status('exporting');
                 $this->filesystem->log('Export process is running');
             }
+            
+            // Add heartbeat to prevent stuck detection
+            add_action('shutdown', array($this, 'update_export_heartbeat'));
             
             // Run the export
             $exporter = new Custom_Migrator_Exporter();
@@ -514,7 +600,72 @@ class Custom_Migrator_Core {
             if (defined('WP_DEBUG') && WP_DEBUG) {
                 $this->filesystem->log('Error trace: ' . $e->getTraceAsString());
             }
+        } catch (Error $e) {
+            // Handle PHP 7+ Fatal Errors
+            $error_message = 'Export failed with fatal error: ' . $e->getMessage();
+            $this->filesystem->write_status('error: ' . $error_message);
+            $this->filesystem->log($error_message);
+            $this->filesystem->log('Error trace: ' . $e->getTraceAsString());
         }
+    }
+
+    /**
+     * Update heartbeat to show export is still active.
+     *
+     * @return void
+     */
+    public function update_export_heartbeat() {
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            $status = trim(file_get_contents($status_file));
+            if (in_array($status, ['exporting', 'resuming'])) {
+                // Touch the file to update modification time
+                touch($status_file);
+            }
+        }
+    }
+
+    /**
+     * Detect if we're running in background.
+     *
+     * @return bool Whether we're running in background.
+     */
+    private function is_background_execution() {
+        return (
+            (defined('DOING_CRON') && DOING_CRON) ||
+            (defined('DOING_AJAX') && DOING_AJAX) ||
+            !isset($_SERVER['HTTP_HOST'])
+        );
+    }
+
+    /**
+     * Setup execution environment for background processing.
+     *
+     * @return void
+     */
+    private function setup_execution_environment() {
+        // Set time limit
+        if (function_exists('set_time_limit') && !ini_get('safe_mode')) {
+            @set_time_limit(0);
+        }
+        
+        // Increase memory limit
+        $current_limit = $this->get_memory_limit_bytes();
+        $target_limit = max($current_limit, 1024 * 1024 * 1024); // At least 1GB
+        @ini_set('memory_limit', $this->format_bytes($target_limit));
+        
+        // Disable output buffering
+        while (ob_get_level()) {
+            ob_end_clean();
+        }
+        
+        // Enable garbage collection
+        if (function_exists('gc_enable')) {
+            gc_enable();
+        }
+        
+        // Log environment setup
+        $this->filesystem->log('Environment: Memory=' . ini_get('memory_limit') . ', Time=' . ini_get('max_execution_time') . ', Safe Mode=' . (ini_get('safe_mode') ? 'On' : 'Off'));
     }
 
     /**
@@ -530,6 +681,27 @@ class Custom_Migrator_Core {
         if ($current_limit_int < 536870912) {
             @ini_set('memory_limit', '512M');
         }
+    }
+
+    /**
+     * Get memory limit in bytes.
+     *
+     * @return int Memory limit in bytes.
+     */
+    private function get_memory_limit_bytes() {
+        $limit = ini_get('memory_limit');
+        if ($limit == -1) return PHP_INT_MAX;
+        
+        $unit = strtolower(substr($limit, -1));
+        $value = (int) $limit;
+        
+        switch ($unit) {
+            case 'g': $value *= 1024;
+            case 'm': $value *= 1024;
+            case 'k': $value *= 1024;
+        }
+        
+        return $value;
     }
 
     /**
@@ -555,6 +727,19 @@ class Custom_Migrator_Core {
         }
         
         return $size;
+    }
+
+    /**
+     * Format bytes to human readable format.
+     *
+     * @param int $bytes Number of bytes.
+     * @return string Formatted string.
+     */
+    private function format_bytes($bytes) {
+        if ($bytes >= 1073741824) return round($bytes / 1073741824, 1) . 'G';
+        if ($bytes >= 1048576) return round($bytes / 1048576, 1) . 'M';
+        if ($bytes >= 1024) return round($bytes / 1024, 1) . 'K';
+        return $bytes . 'B';
     }
 
     /**
