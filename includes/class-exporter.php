@@ -46,13 +46,13 @@ class Custom_Migrator_Exporter {
     private $exclusion_paths = [];
 
     /**
-     * Block format for binary archive (corrected PHP pack/unpack format)
+     * Block format for binary archive (optimized like All-in-One WP Migration)
      * 
      * @var array
      */
     private $block_format = [
-        'pack' => 'a4096VVa4096',  // For pack: filename, size, date, path
-        'unpack' => 'a4096filename/Vsize/Vdate/a4096path'  // For unpack: named fields
+        'pack' => 'a255VVa4112',  // filename(255), size(4), date(4), path(4112) = 4375 bytes
+        'unpack' => 'a255filename/Vsize/Vdate/a4112path'  // For unpack: named fields
     ];
 
     /**
@@ -206,27 +206,29 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Export WordPress content files using structured binary archive.
+     * Export WordPress content files using structured binary archive with CSV streaming.
      */
     private function export_wp_content_archive($hstgr_file) {
         $wp_content_dir = WP_CONTENT_DIR;
         
         $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+        $file_list_csv = $this->filesystem->get_export_dir() . '/file-list.csv';
+        
         $resume_data = $this->load_resume_data($resume_info_file);
         $files_processed = $resume_data['files_processed'];
         $bytes_processed = $resume_data['bytes_processed'];
-        $last_file_path = $resume_data['last_file_path'] ?? '';
-        $file_list_cache = $resume_data['file_list'] ?? null;
+        $csv_position = $resume_data['csv_position'] ?? 0;
         $skipped_count = $resume_data['skipped_count'] ?? 0;
         
         if ($files_processed > 0) {
-            $this->filesystem->log("Resuming export from file " . $files_processed);
+            $this->filesystem->log("Resuming export from file " . $files_processed . ", CSV position: " . $csv_position);
         }
         
-        if (!$file_list_cache) {
-            $this->filesystem->log('Building file list...');
-            $file_list_cache = $this->build_file_list($wp_content_dir);
-            $this->filesystem->log('File list built: ' . count($file_list_cache) . ' files');
+        // Build/load CSV file list (memory efficient)
+        if (!file_exists($file_list_csv) || $csv_position === 0) {
+            $this->filesystem->log('Building CSV file list...');
+            $total_files = $this->build_csv_file_list($wp_content_dir, $file_list_csv);
+            $this->filesystem->log('CSV file list built: ' . $total_files . ' files');
         }
         
         $append_mode = $files_processed > 0 ? 'ab' : 'wb';
@@ -236,13 +238,26 @@ class Custom_Migrator_Exporter {
             throw new Exception('Cannot create or open archive file');
         }
 
+        // Stream CSV file instead of loading into memory
+        $csv_handle = fopen($file_list_csv, 'r');
+        if (!$csv_handle) {
+            throw new Exception('Cannot open CSV file list');
+        }
+        
+        // Skip to resume position
+        if ($csv_position > 0) {
+            fseek($csv_handle, $csv_position);
+        }
+
         $start_time = microtime(true);
         $batch_start_time = microtime(true);
         $files_in_batch = 0;
-        $skip_until_found = !empty($last_file_path);
         $execution_start = time();
+        $current_csv_position = $csv_position;
         
-        foreach ($file_list_cache as $file_info) {
+        while (($csv_line = fgets($csv_handle)) !== false) {
+            $current_csv_position = ftell($csv_handle);
+            
             if ($this->should_pause_processing($execution_start, $batch_start_time, $files_in_batch)) {
                 $this->filesystem->log("Approaching resource limit, saving state after processing $files_processed files");
                 
@@ -250,12 +265,12 @@ class Custom_Migrator_Exporter {
                     'files_processed' => $files_processed,
                     'skipped_count' => $skipped_count,
                     'bytes_processed' => $bytes_processed,
-                    'last_file_path' => $file_info['path'],
-                    'file_list' => $file_list_cache,
+                    'csv_position' => $current_csv_position,
                     'last_update' => time()
                 ]);
                 
                 fclose($archive_handle);
+                fclose($csv_handle);
                 
                 $this->filesystem->write_status('paused');
                 wp_schedule_single_event(time() + 5, 'cm_run_export');
@@ -263,16 +278,19 @@ class Custom_Migrator_Exporter {
                 return 'paused';
             }
             
-            $real_path = $file_info['path'];
-            
-            if ($skip_until_found) {
-                if ($real_path === $last_file_path) {
-                    $skip_until_found = false;
-                }
+            // Parse CSV line: path,relative,size
+            $file_data = str_getcsv(trim($csv_line));
+            if (count($file_data) !== 3) {
                 continue;
             }
             
-            if ($this->is_file_excluded($real_path)) {
+            $file_info = [
+                'path' => $file_data[0],
+                'relative' => $file_data[1],
+                'size' => (int)$file_data[2]
+            ];
+            
+            if ($this->is_file_excluded($file_info['path'])) {
                 $skipped_count++;
                 continue;
             }
@@ -299,6 +317,10 @@ class Custom_Migrator_Exporter {
         }
         
         fclose($archive_handle);
+        fclose($csv_handle);
+        
+        // Clean up CSV file when done
+        @unlink($file_list_csv);
         
         $total_time = microtime(true) - $start_time;
         $this->filesystem->log(sprintf(
@@ -336,11 +358,11 @@ class Custom_Migrator_Exporter {
         $file_dir = dirname($relative_path);
         
         // Truncate strings to fit the fixed-size fields
-        if (strlen($file_name) > 4095) {
-            $file_name = substr($file_name, 0, 4095);
+        if (strlen($file_name) > 254) {
+            $file_name = substr($file_name, 0, 254);
         }
-        if (strlen($file_dir) > 4095) {
-            $file_dir = substr($file_dir, 0, 4095);
+        if (strlen($file_dir) > 4111) {
+            $file_dir = substr($file_dir, 0, 4111);
         }
         
         // Create properly formatted binary block header
@@ -348,7 +370,7 @@ class Custom_Migrator_Exporter {
         $block = pack($this->block_format['pack'], $file_name, $file_size, $file_date, $file_dir);
         
         // Verify block size is correct
-        $expected_size = 4096 + 4 + 4 + 4096; // 8200 bytes
+        $expected_size = 255 + 4 + 4 + 4112; // 4375 bytes
         if (strlen($block) !== $expected_size) {
             $this->filesystem->log("Warning: Binary block size mismatch for {$file_name}. Expected: {$expected_size}, Got: " . strlen($block));
             return ['success' => false, 'bytes' => 0];
@@ -389,10 +411,15 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Build file list.
+     * Build CSV file list (memory efficient streaming).
      */
-    private function build_file_list($wp_content_dir) {
-        $file_list = [];
+    private function build_csv_file_list($wp_content_dir, $file_list_csv) {
+        $csv_handle = fopen($file_list_csv, 'w');
+        if (!$csv_handle) {
+            throw new Exception('Cannot create CSV file list');
+        }
+        
+        $file_count = 0;
         
         try {
             $directory_iterator = new RecursiveDirectoryIterator(
@@ -410,19 +437,32 @@ class Custom_Migrator_Exporter {
                     $real_path = $file->getRealPath();
                     $relative_path = 'wp-content/' . substr($real_path, strlen($wp_content_dir) + 1);
                     
-                    $file_list[] = [
-                        'path' => $real_path,
-                        'relative' => $relative_path,
-                        'size' => $file->getSize()
-                    ];
+                    // Write directly to CSV (memory efficient)
+                    fputcsv($csv_handle, [
+                        $real_path,
+                        $relative_path,
+                        $file->getSize()
+                    ]);
+                    
+                    $file_count++;
+                    
+                    // Periodic memory cleanup for very large sites
+                    if ($file_count % 1000 === 0) {
+                        if (function_exists('gc_collect_cycles')) {
+                            gc_collect_cycles();
+                        }
+                    }
                 }
             }
         } catch (Exception $e) {
-            $this->filesystem->log('Error building file list: ' . $e->getMessage());
-            throw new Exception('Failed to build file list: ' . $e->getMessage());
+            fclose($csv_handle);
+            $this->filesystem->log('Error building CSV file list: ' . $e->getMessage());
+            throw new Exception('Failed to build CSV file list: ' . $e->getMessage());
         }
         
-        return $file_list;
+        fclose($csv_handle);
+        
+        return $file_count;
     }
 
     /**
@@ -456,8 +496,7 @@ class Custom_Migrator_Exporter {
                 'files_processed' => 0,
                 'bytes_processed' => 0,
                 'skipped_count' => 0,
-                'last_file_path' => '',
-                'file_list' => null
+                'csv_position' => 0
             ];
         }
         
@@ -466,8 +505,7 @@ class Custom_Migrator_Exporter {
             'files_processed' => 0,
             'bytes_processed' => 0,
             'skipped_count' => 0,
-            'last_file_path' => '',
-            'file_list' => null
+            'csv_position' => 0
         ];
     }
 
@@ -518,5 +556,106 @@ class Custom_Migrator_Exporter {
         $units = ['B', 'K', 'M', 'G'];
         $factor = floor((strlen($bytes) - 1) / 3);
         return sprintf("%.2f%s", $bytes / pow(1024, $factor), $units[$factor]);
+    }
+
+    /**
+     * Prepare export environment (step 1 of step-by-step export).
+     * 
+     * @return bool Success status.
+     */
+    public function prepare_export() {
+        $this->filesystem->log('Preparing export environment');
+        
+        // Set exclusion paths
+        $this->set_exclusion_paths();
+        
+        // Setup execution environment
+        $this->setup_execution_environment();
+        
+        // Clean any previous resume info
+        $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+        if (file_exists($resume_info_file)) {
+            @unlink($resume_info_file);
+        }
+        
+        $this->filesystem->log('Export environment prepared');
+        return true;
+    }
+
+    /**
+     * Export only wp-content files (step 2 of step-by-step export).
+     * 
+     * @return bool Success status.
+     */
+    public function export_content_only() {
+        $this->filesystem->log('Starting wp-content export step');
+        
+        $file_paths = $this->filesystem->get_export_file_paths();
+        $hstgr_file = $file_paths['hstgr'];
+        
+        // Check if .hstgr file already exists and has content
+        if (file_exists($hstgr_file) && filesize($hstgr_file) > 0) {
+            $file_size = $this->format_bytes(filesize($hstgr_file));
+            $this->filesystem->log("wp-content file already exists ($file_size), skipping content export");
+            return true;
+        }
+        
+        $content_export_result = $this->export_wp_content_archive($hstgr_file);
+        
+        if ($content_export_result === 'paused') {
+            $this->filesystem->log('wp-content export paused, will continue in next step');
+            return false; // Not complete yet
+        }
+        
+        $this->filesystem->log('wp-content export completed');
+        return true;
+    }
+
+    /**
+     * Export only database (step 3 of step-by-step export).
+     * 
+     * @return bool Success status.
+     */
+    public function export_database_only() {
+        $this->filesystem->log('Starting database export step');
+        
+        $file_paths = $this->filesystem->get_export_file_paths();
+        $sql_file = $file_paths['sql'];
+        
+        // Check if database file already exists
+        if (file_exists($sql_file) || file_exists($sql_file . '.gz')) {
+            $this->filesystem->log('Database file already exists, skipping');
+            return true;
+        }
+        
+        $this->database->export($sql_file);
+        $this->filesystem->log('Database export completed');
+        return true;
+    }
+
+    /**
+     * Generate only metadata (step 4 of step-by-step export).
+     * 
+     * @return bool Success status.
+     */
+    public function generate_metadata_only() {
+        $this->filesystem->log('Starting metadata generation step');
+        
+        $file_paths = $this->filesystem->get_export_file_paths();
+        $meta_file = $file_paths['metadata'];
+        
+        // Check if metadata file already exists
+        if (file_exists($meta_file)) {
+            $this->filesystem->log('Metadata file already exists, skipping');
+            return true;
+        }
+        
+        $meta = $this->metadata->generate();
+        $meta['export_info']['file_format'] = $this->file_extension;
+        $meta['export_info']['exporter_version'] = CUSTOM_MIGRATOR_VERSION;
+        
+        file_put_contents($meta_file, wp_json_encode($meta, JSON_PRETTY_PRINT));
+        $this->filesystem->log('Metadata generation completed');
+        return true;
     }
 }

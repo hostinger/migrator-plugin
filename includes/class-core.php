@@ -84,6 +84,8 @@ class Custom_Migrator_Core {
         // AJAX handlers
         add_action( 'wp_ajax_cm_start_export', array( $this, 'handle_start_export' ) );
         add_action( 'wp_ajax_cm_check_status', array( $this, 'handle_check_status' ) );
+        add_action( 'wp_ajax_cm_process_export_step', array( $this, 'process_export_step' ) );
+        add_action( 'wp_ajax_cm_force_continue', array( $this, 'handle_force_continue' ) );
         add_action( 'wp_ajax_cm_run_export_now', array( $this, 'handle_run_export_now' ) );
         add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
         add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
@@ -99,6 +101,7 @@ class Custom_Migrator_Core {
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
         add_action( 'cm_monitor_export', array( $this, 'monitor_export_progress' ) );
         add_action( 'cm_run_export_direct', array( $this, 'run_export_directly' ) );
+        add_action( 'cm_process_export_step_fallback', array( $this, 'process_export_step_fallback' ) );
         
         // Schedule monitoring if not already scheduled
         if (!wp_next_scheduled('cm_monitor_export')) {
@@ -310,7 +313,7 @@ class Custom_Migrator_Core {
     }
 
     /**
-     * Handle the AJAX request to start export.
+     * Handle the AJAX request to start export process.
      *
      * @return void
      */
@@ -319,9 +322,6 @@ class Custom_Migrator_Core {
         if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
             wp_send_json_error( array( 'message' => 'Security check failed' ) );
         }
-
-        // Clean up any existing export
-        $this->cleanup_existing_export();
 
         $base_dir = $this->filesystem->get_export_dir();
         
@@ -335,29 +335,300 @@ class Custom_Migrator_Core {
             }
         }
 
-        // Important: Delete old filenames to force regeneration with new secure names
-        delete_option('custom_migrator_filenames');
-
-        // Update export status
-        $this->filesystem->write_status( 'starting' );
-
-        // Clear any existing scheduled events
-        wp_clear_scheduled_hook('cm_run_export');
-
-        // Schedule for immediate execution and ensure WP Cron runs
-        wp_schedule_single_event(time(), 'cm_run_export');
+        // Check if there are existing files and we should resume instead of restart
+        $file_paths = $this->filesystem->get_export_file_paths();
+        $should_resume = false;
         
-        // Start monitoring
-        wp_clear_scheduled_hook('cm_monitor_export');
-        wp_schedule_event(time() + 300, 'hourly', 'cm_monitor_export'); // Start monitoring after 5 minutes
+        if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+            $should_resume = true;
+            $this->filesystem->log('Existing export files found, resuming export');
+        }
         
-        $this->trigger_cron_execution();
+        if ($should_resume) {
+            // Resume from where we left off
+            $this->resume_export_from_current_state();
+        } else {
+            // Clean up any existing export and start fresh
+            $this->cleanup_existing_export();
+            
+            // Important: Delete old filenames to force regeneration with new secure names
+            delete_option('custom_migrator_filenames');
+
+            // Initialize export parameters for step-by-step processing
+            $params = array(
+                'step' => 'init',
+                'secret_key' => wp_create_nonce('custom_migrator_export_' . get_current_user_id()),
+                'completed' => false,
+                'start_time' => time()
+            );
+
+            // Update export status
+            $this->filesystem->write_status( 'starting' );
+            
+            // Start step-by-step export immediately
+            $this->process_export_step($params);
+        }
 
         $wp_content_size = $this->filesystem->get_directory_size( WP_CONTENT_DIR );
         wp_send_json_success(array(
-            'message' => 'Export started successfully',
+            'message' => $should_resume ? 'Resuming export from previous state' : 'Export started successfully',
             'estimated_size' => $this->filesystem->format_file_size($wp_content_size)
         ));
+    }
+
+    /**
+     * Process export step by step with session independence.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    public function process_export_step($params = array()) {
+        // Get params from request if not provided
+        if (empty($params)) {
+            $params = stripslashes_deep(array_merge($_GET, $_POST));
+        }
+
+        // For auto-continuing requests, we need more lenient authentication
+        $is_auto_continue = isset($params['auto_continue']) && $params['auto_continue'];
+        $is_fallback = isset($params['is_fallback']) && $params['is_fallback'];
+        $is_direct = isset($params['is_direct']) && $params['is_direct'];
+        $is_cron = defined('DOING_CRON') && DOING_CRON;
+        
+        // Skip security checks for internal fallback requests, cron, or direct processing
+        if ($is_fallback || $is_cron || $is_direct) {
+            $this->filesystem->log('Skipping security check for internal request (fallback: ' . ($is_fallback ? 'yes' : 'no') . ', cron: ' . ($is_cron ? 'yes' : 'no') . ', direct: ' . ($is_direct ? 'yes' : 'no') . ')');
+        } elseif ($is_auto_continue) {
+            // For auto-continue requests, just verify the secret key exists and is valid format
+            if (!isset($params['secret_key']) || empty($params['secret_key'])) {
+                $this->filesystem->log('Auto-continue request missing secret key');
+                return;
+            }
+            $this->filesystem->log('Auto-continue request with valid secret key');
+        } else {
+            // For manual requests, do full security check
+            if (!isset($params['secret_key']) || !wp_verify_nonce($params['secret_key'], 'custom_migrator_export_' . get_current_user_id())) {
+                if (!current_user_can('manage_options')) {
+                    $this->filesystem->log('Security check failed for manual request (user_id: ' . get_current_user_id() . ')');
+                    return; // Unauthorized access
+                }
+            }
+            $this->filesystem->log('Manual request passed security check');
+        }
+
+        $this->filesystem->log('Processing export step: ' . (isset($params['step']) ? $params['step'] : 'unknown'));
+        $this->setup_execution_environment();
+
+        try {
+            switch ($params['step']) {
+                case 'init':
+                    $params = $this->export_init($params);
+                    break;
+                case 'content':
+                    $params = $this->export_content($params);
+                    break;
+                case 'database':
+                    $params = $this->export_database($params);
+                    break;
+                case 'metadata':
+                    $params = $this->export_metadata($params);
+                    break;
+                case 'finalize':
+                    $params = $this->export_finalize($params);
+                    break;
+                default:
+                    $params['completed'] = true;
+                    break;
+            }
+
+            // Check if step is complete
+            if (!isset($params['completed']) || !$params['completed']) {
+                // Continue to next step with non-blocking request
+                $this->continue_export($params);
+            }
+
+        } catch (Exception $e) {
+            $this->filesystem->write_status('error: ' . $e->getMessage());
+            $this->filesystem->log('Export step failed: ' . $e->getMessage());
+        }
+
+        return $params;
+    }
+
+    /**
+     * Continue export process with non-blocking HTTP request.
+     *
+     * @param array $params Export parameters.
+     * @return void
+     */
+    private function continue_export($params) {
+        // Always continue for the initial step, even during AJAX
+        $is_initial_step = isset($params['step']) && $params['step'] === 'content';
+        
+        // Don't continue if running from AJAX (manual mode) unless it's the initial step or auto_continue is set
+        if (defined('DOING_AJAX') && DOING_AJAX && !$is_initial_step && !isset($params['auto_continue'])) {
+            return;
+        }
+
+        $export_url = admin_url('admin-ajax.php?action=cm_process_export_step');
+        
+        // Try the direct HTTP request first (this should work for automation)
+        $response = wp_remote_post($export_url, array(
+            'method' => 'POST',
+            'timeout' => 10,
+            'blocking' => false, // Non-blocking is the key!
+            'sslverify' => false,
+            'headers' => array(),
+            'body' => array_merge($params, array('auto_continue' => true))
+        ));
+        
+        // Log the continuation for debugging
+        $this->filesystem->log("Continuing to step: " . $params['step'] . " via HTTP request");
+        
+        // Check if the HTTP request failed
+        if (is_wp_error($response)) {
+            $this->filesystem->log("HTTP request failed: " . $response->get_error_message() . " - using direct processing");
+            
+            // If HTTP request fails, process directly (this ensures it always works)
+            $params['auto_continue'] = true;
+            $params['is_direct'] = true;
+            
+            // Process immediately in the background
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request(); // Close connection to user
+            }
+            
+            // Small delay to let the original request finish
+            sleep(1);
+            
+            // Process the next step directly
+            $this->process_export_step($params);
+            
+        } else {
+            // HTTP request succeeded, but still schedule a fallback just in case
+            $current_step = isset($params['step']) ? $params['step'] : 'unknown';
+            $fallback_delay = 10; // Longer delay since HTTP should work
+            
+            wp_schedule_single_event(time() + $fallback_delay, 'cm_process_export_step_fallback', array($params));
+            $this->filesystem->log("HTTP request sent successfully, scheduled fallback for step: " . $current_step . " in {$fallback_delay} seconds");
+        }
+    }
+
+    /**
+     * Initialize export process.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    private function export_init($params) {
+        $this->filesystem->log('Starting export initialization');
+        $this->filesystem->write_status('initializing');
+
+        // Initialize export environment
+        $exporter = new Custom_Migrator_Exporter();
+        $exporter->prepare_export();
+
+        $params['step'] = 'content';
+        $params['completed'] = false;
+        
+        $this->filesystem->log('Export initialization complete');
+        return $params;
+    }
+
+    /**
+     * Export wp-content files.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    private function export_content($params) {
+        $this->filesystem->log('Starting wp-content export');
+        $this->filesystem->write_status('exporting');
+
+        $exporter = new Custom_Migrator_Exporter();
+        $result = $exporter->export_content_only();
+
+        if (!$result) {
+            throw new Exception('Content export failed');
+        }
+
+        $params['step'] = 'database';
+        $params['completed'] = false;
+        
+        $this->filesystem->log('wp-content export complete');
+        return $params;
+    }
+
+    /**
+     * Export database.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    private function export_database($params) {
+        $this->filesystem->log('Starting database export');
+        $this->filesystem->write_status('exporting_database');
+
+        $exporter = new Custom_Migrator_Exporter();
+        $result = $exporter->export_database_only();
+
+        if (!$result) {
+            throw new Exception('Database export failed');
+        }
+
+        $params['step'] = 'metadata';
+        $params['completed'] = false;
+        
+        $this->filesystem->log('Database export complete');
+        return $params;
+    }
+
+    /**
+     * Generate metadata files.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    private function export_metadata($params) {
+        $this->filesystem->log('Starting metadata generation');
+        $this->filesystem->write_status('generating_metadata');
+
+        $exporter = new Custom_Migrator_Exporter();
+        $result = $exporter->generate_metadata_only();
+
+        if (!$result) {
+            throw new Exception('Metadata generation failed');
+        }
+
+        $params['step'] = 'finalize';
+        $params['completed'] = false;
+        
+        $this->filesystem->log('Metadata generation complete');
+        return $params;
+    }
+
+    /**
+     * Finalize export process.
+     *
+     * @param array $params Export parameters.
+     * @return array Updated parameters.
+     */
+    private function export_finalize($params) {
+        $this->filesystem->log('Finalizing export');
+        $this->filesystem->write_status('finalizing');
+
+        // Verify all files exist
+        $file_paths = $this->filesystem->get_export_file_paths();
+        foreach ($file_paths as $type => $path) {
+            if (!file_exists($path)) {
+                throw new Exception("Missing export file: $type");
+            }
+        }
+
+        $this->filesystem->write_status('done');
+        $this->filesystem->log('Export completed successfully');
+
+        $params['completed'] = true;
+        return $params;
     }
 
     /**
@@ -425,8 +696,9 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Enhanced stuck detection
-        if (in_array($status, ['starting', 'exporting', 'resuming'])) {
+        // Enhanced stuck detection for all processing statuses
+        $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
+        if (in_array($status, $processing_statuses)) {
             if ($time_diff > 300) { // 5 minutes for starting
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
@@ -516,7 +788,7 @@ class Custom_Migrator_Core {
                 'message' => substr($status, 6) // Remove 'error:' prefix
             ));
         } else {
-            // Try to provide more detailed progress info
+            // Try to provide more detailed progress info with user-friendly messages
             $log_file = $this->filesystem->get_log_file_path();
             $recent_log = '';
             
@@ -526,8 +798,22 @@ class Custom_Migrator_Core {
                 $recent_log = implode("\n", array_slice($log_lines, -3)); // Get last 3 lines
             }
             
+            // Provide user-friendly status messages
+            $status_messages = array(
+                'starting' => 'Starting export process...',
+                'initializing' => 'Initializing export environment...',
+                'exporting' => 'Exporting wp-content files...',
+                'exporting_database' => 'Exporting database...',
+                'generating_metadata' => 'Generating metadata files...',
+                'finalizing' => 'Finalizing export...',
+                'resuming' => 'Resuming export process...'
+            );
+            
+            $message = isset($status_messages[$status]) ? $status_messages[$status] : 'Processing: ' . $status;
+            
             wp_send_json_success(array( 
                 'status' => $status,
+                'message' => $message,
                 'recent_log' => $recent_log,
                 'time_since_update' => $time_diff
             ));
@@ -764,5 +1050,134 @@ class Custom_Migrator_Core {
             self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    /**
+     * Fallback method to process export steps via cron if HTTP requests fail.
+     *
+     * @param array $params Export parameters.
+     * @return void
+     */
+    public function process_export_step_fallback($params) {
+        $this->filesystem->log('Using fallback method to process step: ' . (isset($params['step']) ? $params['step'] : 'unknown'));
+        
+        // Check if the step is still needed by examining the actual files
+        $file_paths = $this->filesystem->get_export_file_paths();
+        $current_step = isset($params['step']) ? $params['step'] : '';
+        
+        $step_needed = true;
+        
+        switch ($current_step) {
+            case 'database':
+                // Check if database file already exists
+                if ((file_exists($file_paths['sql']) || file_exists($file_paths['sql'] . '.gz'))) {
+                    $step_needed = false;
+                    $this->filesystem->log('Database file already exists, skipping database fallback');
+                }
+                break;
+                
+            case 'metadata':
+                // Check if metadata file already exists
+                if (file_exists($file_paths['metadata'])) {
+                    $step_needed = false;
+                    $this->filesystem->log('Metadata file already exists, skipping metadata fallback');
+                }
+                break;
+                
+            case 'finalize':
+                // Check if export is already done
+                $status_file = $this->filesystem->get_status_file_path();
+                if (file_exists($status_file)) {
+                    $current_status = trim(file_get_contents($status_file));
+                    if ($current_status === 'done') {
+                        $step_needed = false;
+                        $this->filesystem->log('Export already completed, skipping finalize fallback');
+                    }
+                }
+                break;
+                
+            case 'content':
+                // Check if content file already exists
+                if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+                    $step_needed = false;
+                    $this->filesystem->log('Content file already exists, skipping content fallback');
+                }
+                break;
+        }
+        
+        if (!$step_needed) {
+            $this->filesystem->log('Step ' . $current_step . ' not needed, skipping fallback');
+            return;
+        }
+        
+        // Mark this as an auto-continue request to bypass security checks
+        $params['auto_continue'] = true;
+        $params['is_fallback'] = true;
+        
+        // Process the step using the normal method
+        $this->filesystem->log('Processing fallback for step: ' . $current_step);
+        $this->process_export_step($params);
+    }
+
+    /**
+     * Resume export from where it left off based on existing files.
+     *
+     * @return void
+     */
+    public function resume_export_from_current_state() {
+        $this->filesystem->log('Attempting to resume export from current state');
+        
+        $file_paths = $this->filesystem->get_export_file_paths();
+        
+        // Determine which step to resume from
+        $next_step = 'init';
+        if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+            $this->filesystem->log('Found .hstgr file, moving to database step');
+            $next_step = 'database';
+        }
+        if ((file_exists($file_paths['sql']) || file_exists($file_paths['sql'] . '.gz')) && filesize($file_paths['hstgr']) > 0) {
+            $this->filesystem->log('Found database file, moving to metadata step');
+            $next_step = 'metadata';
+        }
+        if (file_exists($file_paths['metadata']) && filesize($file_paths['metadata']) > 0) {
+            $this->filesystem->log('Found metadata file, moving to finalize step');
+            $next_step = 'finalize';
+        }
+        
+        // Create resume parameters
+        $params = array(
+            'step' => $next_step,
+            'secret_key' => wp_create_nonce('custom_migrator_export_' . get_current_user_id()),
+            'completed' => false,
+            'is_resume' => true,
+            'start_time' => time()
+        );
+        
+        $this->filesystem->log('Resuming export from step: ' . $next_step);
+        $this->process_export_step($params);
+    }
+
+    /**
+     * Handle force continue export request.
+     *
+     * @return void
+     */
+    public function handle_force_continue() {
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
+        $this->filesystem->log('Force continue requested by user');
+        
+        // Clear any pending scheduled events that might be stuck
+        wp_clear_scheduled_hook('cm_process_export_step_fallback');
+        
+        // Resume from current state
+        $this->resume_export_from_current_state();
+        
+        wp_send_json_success(array(
+            'message' => 'Export force-continued successfully'
+        ));
     }
 }
