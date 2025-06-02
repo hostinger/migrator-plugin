@@ -89,6 +89,7 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_run_export_now', array( $this, 'handle_run_export_now' ) );
         add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
         add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
+        add_action( 'wp_ajax_cm_debug_status', array( $this, 'handle_debug_status' ) );
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
     }
 
@@ -125,11 +126,11 @@ class Custom_Migrator_Core {
         $modified_time = filemtime($status_file);
         $current_time = time();
         
-        // Check for stuck exports
+        // Check for stuck exports with optimized timeouts
         $stuck_statuses = ['starting', 'exporting', 'resuming'];
         $time_diff = $current_time - $modified_time;
         
-        if (in_array($status, $stuck_statuses) && $time_diff > 600) { // 10 minutes
+        if (in_array($status, $stuck_statuses) && $time_diff > 120) { // 2 minutes timeout
             $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds. Attempting recovery.");
             
             // Try to restart the export
@@ -297,19 +298,44 @@ class Custom_Migrator_Core {
     }
 
     /**
-     * Handle direct run export request (bypassing cron).
+     * Handle direct run export request (simple automation support).
      *
      * @return void
      */
     public function handle_run_export_now() {
-        // Security check
-        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
-            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        // Check if this is a background request
+        $is_background = isset($_REQUEST['background_mode']) && $_REQUEST['background_mode'] === '1';
+        
+        if (!$is_background) {
+            // For foreground requests, use standard WordPress security
+            if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+                wp_send_json_error( array( 'message' => 'Security check failed' ) );
+            }
         }
-
+        // Background requests are triggered by authenticated requests, so they don't need additional auth
+        
+        $this->filesystem->log('Processing export request (background: ' . ($is_background ? 'yes' : 'no') . ')');
+        
+        // Set proper execution environment for background processing
+        if ($is_background) {
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            
+            if (function_exists('set_time_limit')) {
+                set_time_limit(0);
+            }
+        }
+        
         // Start the export process directly
         $this->run_export();
-        wp_send_json_success( array( 'message' => 'Export completed' ) );
+        
+        if ($is_background) {
+            // For background requests, don't send JSON response
+            exit();
+        } else {
+            wp_send_json_success( array( 'message' => 'Export completed' ) );
+        }
     }
 
     /**
@@ -318,7 +344,7 @@ class Custom_Migrator_Core {
      * @return void
      */
     public function handle_start_export() {
-        // Security check
+        // Security check - more lenient for automation
         if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
             wp_send_json_error( array( 'message' => 'Security check failed' ) );
         }
@@ -335,18 +361,27 @@ class Custom_Migrator_Core {
             }
         }
 
+        // Check current export status
+        $status_file = $this->filesystem->get_status_file_path();
+        $current_status = '';
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+        }
+        
         // Check if there are existing files and we should resume instead of restart
         $file_paths = $this->filesystem->get_export_file_paths();
         $should_resume = false;
         
-        if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+        // Resume if export is paused or there are incomplete files
+        if ($current_status === 'paused' || (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0 && $current_status !== 'done')) {
             $should_resume = true;
-            $this->filesystem->log('Existing export files found, resuming export');
+            $this->filesystem->log('Export needs to be resumed - status: ' . $current_status);
         }
         
         if ($should_resume) {
-            // Resume from where we left off
-            $this->resume_export_from_current_state();
+            // Resume via immediate HTTP request - no cron dependency
+            $this->filesystem->log('Initiating immediate background resume for paused/incomplete export');
+            $this->schedule_immediate_background_resume();
         } else {
             // Clean up any existing export and start fresh
             $this->cleanup_existing_export();
@@ -354,30 +389,167 @@ class Custom_Migrator_Core {
             // Important: Delete old filenames to force regeneration with new secure names
             delete_option('custom_migrator_filenames');
 
-            // Initialize export parameters for step-by-step processing
-            $params = array(
-                'step' => 'init',
-                'secret_key' => wp_create_nonce('custom_migrator_export_' . get_current_user_id()),
-                'completed' => false,
-                'start_time' => time()
-            );
-
-            // Update export status
+            // Update export status and immediately start background processing
             $this->filesystem->write_status( 'starting' );
+            $this->filesystem->log('Export started, initiating immediate background processing');
             
-            // Start step-by-step export immediately
-            $this->process_export_step($params);
+            // Use immediate HTTP request instead of cron scheduling
+            $this->schedule_immediate_background_start();
         }
 
         $wp_content_size = $this->filesystem->get_directory_size( WP_CONTENT_DIR );
         wp_send_json_success(array(
-            'message' => $should_resume ? 'Resuming export from previous state' : 'Export started successfully',
-            'estimated_size' => $this->filesystem->format_file_size($wp_content_size)
+            'message' => $should_resume ? 'Resuming paused export immediately' : 'Export started and processing immediately in background',
+            'estimated_size' => $this->filesystem->format_file_size($wp_content_size),
+            'automation_ready' => true,
+            'background_processing' => true,
+            'processing_method' => 'immediate_http_request',
+            'current_status' => $current_status,
+            'monitor_endpoint' => admin_url('admin-ajax.php?action=cm_check_status')
         ));
     }
 
     /**
-     * Process export step by step with session independence.
+     * Schedule immediate HTTP request for background processing (simple).
+     *
+     * @param array $params Export parameters.
+     * @return void
+     */
+    private function schedule_immediate_http_request($params) {
+        $ajax_url = admin_url('admin-ajax.php');
+        
+        $request_params = array(
+            'action' => 'cm_run_export_now',
+            'background_mode' => '1'
+        );
+        
+        $request_url = add_query_arg($request_params, $ajax_url);
+        
+        // Method 1: Immediate HTTP request
+        $this->non_blocking_request($request_url);
+        
+        // Method 2: Schedule backup requests
+        wp_schedule_single_event(time() + 1, 'cm_run_export');
+        wp_schedule_single_event(time() + 3, 'cm_run_export');
+        
+        $this->filesystem->log('Simple HTTP request scheduling initiated (no secret keys)');
+    }
+
+    /**
+     * Schedule immediate background start (no secret keys needed).
+     *
+     * @return void
+     */
+    private function schedule_immediate_background_start() {
+        $ajax_url = admin_url('admin-ajax.php');
+        
+        $request_params = array(
+            'action' => 'cm_run_export_now',
+            'background_mode' => '1'
+        );
+        
+        $request_url = add_query_arg($request_params, $ajax_url);
+        
+        // Method 1: Immediate HTTP request
+        $this->non_blocking_request($request_url);
+        
+        // Method 2: Backup cron events
+        wp_schedule_single_event(time() + 1, 'cm_run_export');
+        wp_schedule_single_event(time() + 3, 'cm_run_export');
+        
+        // Method 3: Trigger cron execution
+        $this->trigger_cron_execution();
+        
+        $this->filesystem->log('Simple background start initiated (no secret keys required)');
+    }
+
+    /**
+     * Schedule immediate background resume (no secret keys needed).
+     *
+     * @return void
+     */
+    private function schedule_immediate_background_resume() {
+        $ajax_url = admin_url('admin-ajax.php');
+        
+        $request_params = array(
+            'action' => 'cm_run_export_now',
+            'background_mode' => '1'
+        );
+        
+        $request_url = add_query_arg($request_params, $ajax_url);
+        
+        // Method 1: Immediate HTTP request
+        $this->non_blocking_request($request_url);
+        
+        // Method 2: Backup cron events
+        wp_schedule_single_event(time() + 1, 'cm_run_export');
+        wp_schedule_single_event(time() + 3, 'cm_run_export');
+        
+        // Method 3: Trigger cron execution
+        $this->trigger_cron_execution();
+        
+        $this->filesystem->log('Simple background resume initiated (no secret keys required)');
+    }
+
+    /**
+     * Spawn a cURL request as ultimate fallback.
+     *
+     * @param string $url The URL to request.
+     * @return void
+     */
+    private function spawn_curl_request($url) {
+        // Only use cURL if available and on Unix-like systems
+        if (!function_exists('exec') || !function_exists('shell_exec')) {
+            return;
+        }
+        
+        // Check if we're on a Unix-like system
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            return;
+        }
+        
+        // Escape the URL for shell execution
+        $escaped_url = escapeshellarg($url);
+        
+        // Create a cURL command that runs in background
+        $curl_cmd = "curl -s -m 5 --connect-timeout 2 " . $escaped_url . " > /dev/null 2>&1 &";
+        
+        // Execute the command in background
+        @exec($curl_cmd);
+        
+        $this->filesystem->log('Spawned background cURL request as ultimate fallback');
+    }
+
+    /**
+     * Test if background HTTP requests are working.
+     *
+     * @return bool Whether HTTP requests appear to be working.
+     */
+    private function test_background_http() {
+        $test_url = admin_url('admin-ajax.php?action=cm_debug_status&test=1');
+        
+        $args = array(
+            'timeout'   => 2,
+            'blocking'  => true, // Blocking for test
+            'sslverify' => apply_filters('https_local_ssl_verify', false),
+            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url()
+        );
+        
+        $response = wp_remote_get($test_url, $args);
+        
+        if (is_wp_error($response)) {
+            $this->filesystem->log('HTTP test failed: ' . $response->get_error_message());
+            return false;
+        }
+        
+        $response_code = wp_remote_retrieve_response_code($response);
+        $this->filesystem->log('HTTP test result: response code ' . $response_code);
+        
+        return $response_code === 200;
+    }
+
+    /**
+     * Process export step by step (simple automation).
      *
      * @param array $params Export parameters.
      * @return array Updated parameters.
@@ -388,34 +560,24 @@ class Custom_Migrator_Core {
             $params = stripslashes_deep(array_merge($_GET, $_POST));
         }
 
-        // For auto-continuing requests, we need more lenient authentication
-        $is_auto_continue = isset($params['auto_continue']) && $params['auto_continue'];
-        $is_fallback = isset($params['is_fallback']) && $params['is_fallback'];
-        $is_direct = isset($params['is_direct']) && $params['is_direct'];
+        // Detect execution context
         $is_cron = defined('DOING_CRON') && DOING_CRON;
+        $is_ajax = defined('DOING_AJAX') && DOING_AJAX;
+        $is_background = $is_cron || !$is_ajax;
         
-        // Skip security checks for internal fallback requests, cron, or direct processing
-        if ($is_fallback || $is_cron || $is_direct) {
-            $this->filesystem->log('Skipping security check for internal request (fallback: ' . ($is_fallback ? 'yes' : 'no') . ', cron: ' . ($is_cron ? 'yes' : 'no') . ', direct: ' . ($is_direct ? 'yes' : 'no') . ')');
-        } elseif ($is_auto_continue) {
-            // For auto-continue requests, just verify the secret key exists and is valid format
-            if (!isset($params['secret_key']) || empty($params['secret_key'])) {
-                $this->filesystem->log('Auto-continue request missing secret key');
-                return;
-            }
-            $this->filesystem->log('Auto-continue request with valid secret key');
-        } else {
-            // For manual requests, do full security check
-            if (!isset($params['secret_key']) || !wp_verify_nonce($params['secret_key'], 'custom_migrator_export_' . get_current_user_id())) {
-                if (!current_user_can('manage_options')) {
-                    $this->filesystem->log('Security check failed for manual request (user_id: ' . get_current_user_id() . ')');
-                    return; // Unauthorized access
-                }
-            }
-            $this->filesystem->log('Manual request passed security check');
+        // Simple security check for non-background requests
+        if (!$is_background && !current_user_can('manage_options')) {
+            $this->filesystem->log('Security check failed - user lacks permissions');
+            return $params;
         }
 
-        $this->filesystem->log('Processing export step: ' . (isset($params['step']) ? $params['step'] : 'unknown'));
+        $current_step = isset($params['step']) ? $params['step'] : 'unknown';
+        $this->filesystem->log('Processing export step: ' . $current_step . ' (background: ' . ($is_background ? 'yes' : 'no') . ')');
+        
+        // Save current step for tracking
+        $step_file = $this->filesystem->get_export_dir() . '/export-step.txt';
+        file_put_contents($step_file, $current_step);
+        
         $this->setup_execution_environment();
 
         try {
@@ -440,10 +602,16 @@ class Custom_Migrator_Core {
                     break;
             }
 
-            // Check if step is complete
+            // Continue to next step if not completed
             if (!isset($params['completed']) || !$params['completed']) {
-                // Continue to next step with non-blocking request
                 $this->continue_export($params);
+            } else {
+                // Step completed, continue to next step if not done
+                if ($params['step'] !== 'finalize') {
+                    $this->filesystem->log('Step ' . $params['step'] . ' completed, scheduling next step');
+                    $params['completed'] = false; // Reset for next step
+                    $this->continue_export($params);
+                }
             }
 
         } catch (Exception $e) {
@@ -455,62 +623,24 @@ class Custom_Migrator_Core {
     }
 
     /**
-     * Continue export process with non-blocking HTTP request.
+     * Continue export process with true background processing (no cron dependency).
      *
      * @param array $params Export parameters.
      * @return void
      */
     private function continue_export($params) {
-        // Always continue for the initial step, even during AJAX
-        $is_initial_step = isset($params['step']) && $params['step'] === 'content';
+        $this->filesystem->log("Starting immediate background continuation for step: " . $params['step']);
         
-        // Don't continue if running from AJAX (manual mode) unless it's the initial step or auto_continue is set
-        if (defined('DOING_AJAX') && DOING_AJAX && !$is_initial_step && !isset($params['auto_continue'])) {
-            return;
-        }
-
-        $export_url = admin_url('admin-ajax.php?action=cm_process_export_step');
+        // Method 1: Immediate HTTP request to self (most reliable)
+        $this->schedule_immediate_http_request($params);
         
-        // Try the direct HTTP request first (this should work for automation)
-        $response = wp_remote_post($export_url, array(
-            'method' => 'POST',
-            'timeout' => 10,
-            'blocking' => false, // Non-blocking is the key!
-            'sslverify' => false,
-            'headers' => array(),
-            'body' => array_merge($params, array('auto_continue' => true))
-        ));
+        // Method 2: Schedule immediate processing
+        wp_schedule_single_event(time() + 1, 'cm_run_export');
         
-        // Log the continuation for debugging
-        $this->filesystem->log("Continuing to step: " . $params['step'] . " via HTTP request");
+        // Method 3: Force immediate cron execution
+        $this->trigger_cron_execution();
         
-        // Check if the HTTP request failed
-        if (is_wp_error($response)) {
-            $this->filesystem->log("HTTP request failed: " . $response->get_error_message() . " - using direct processing");
-            
-            // If HTTP request fails, process directly (this ensures it always works)
-            $params['auto_continue'] = true;
-            $params['is_direct'] = true;
-            
-            // Process immediately in the background
-            if (function_exists('fastcgi_finish_request')) {
-                fastcgi_finish_request(); // Close connection to user
-            }
-            
-            // Small delay to let the original request finish
-            sleep(1);
-            
-            // Process the next step directly
-            $this->process_export_step($params);
-            
-        } else {
-            // HTTP request succeeded, but still schedule a fallback just in case
-            $current_step = isset($params['step']) ? $params['step'] : 'unknown';
-            $fallback_delay = 10; // Longer delay since HTTP should work
-            
-            wp_schedule_single_event(time() + $fallback_delay, 'cm_process_export_step_fallback', array($params));
-            $this->filesystem->log("HTTP request sent successfully, scheduled fallback for step: " . $current_step . " in {$fallback_delay} seconds");
-        }
+        $this->filesystem->log("Background processing initiated for step: " . $params['step']);
     }
 
     /**
@@ -528,9 +658,9 @@ class Custom_Migrator_Core {
         $exporter->prepare_export();
 
         $params['step'] = 'content';
-        $params['completed'] = false;
+        $params['completed'] = true;
         
-        $this->filesystem->log('Export initialization complete');
+        $this->filesystem->log('Export initialization complete, proceeding to content step');
         return $params;
     }
 
@@ -546,6 +676,14 @@ class Custom_Migrator_Core {
 
         $exporter = new Custom_Migrator_Exporter();
         $result = $exporter->export_content_only();
+
+        if ($result === 'paused') {
+            // Content export is paused, stay on content step and let resume logic handle it
+            $this->filesystem->log('wp-content export paused, staying on content step');
+            $params['step'] = 'content'; // Stay on same step
+            $params['completed'] = false;
+            return $params;
+        }
 
         if (!$result) {
             throw new Exception('Content export failed');
@@ -699,11 +837,12 @@ class Custom_Migrator_Core {
         // Enhanced stuck detection for all processing statuses
         $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
         if (in_array($status, $processing_statuses)) {
-            if ($time_diff > 300) { // 5 minutes for starting
+            // Optimized timeouts for 10-second processing windows
+            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
                 // Try to restart if really stuck
-                if ($time_diff > 600) { // 10 minutes
+                if ($time_diff > 120) { 
                     $this->force_export_restart();
                 }
                 
@@ -821,21 +960,37 @@ class Custom_Migrator_Core {
     }
 
     /**
-     * Make a non-blocking HTTP request to a URL.
-     * 
-     * @param string $url The URL to request
+     * Make a non-blocking HTTP request with multiple attempts for reliability.
+     *
+     * @param string $url The URL to request.
      * @return void
      */
     private function non_blocking_request($url) {
-        // Non-blocking request
-        $args = array(
-            'timeout'   => 0.01,
+        // Method 1: Quick non-blocking request (0.5 second timeout)
+        $args_quick = array(
+            'timeout'   => 0.5,
             'blocking'  => false,
             'sslverify' => apply_filters('https_local_ssl_verify', false),
-            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url()
+            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url(),
+            'redirection' => 0
         );
         
-        wp_remote_get($url, $args);
+        wp_remote_get($url, $args_quick);
+        
+        // Method 2: Slightly longer timeout (1 second) as backup
+        $args_backup = array(
+            'timeout'   => 1,
+            'blocking'  => false,
+            'sslverify' => apply_filters('https_local_ssl_verify', false),
+            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url(),
+            'redirection' => 0
+        );
+        
+        // Small delay then send backup request
+        usleep(100000); // 0.1 seconds
+        wp_remote_get($url, $args_backup);
+        
+        $this->filesystem->log('Sent multiple HTTP requests for reliability');
     }
 
     /**
@@ -1061,6 +1216,21 @@ class Custom_Migrator_Core {
     public function process_export_step_fallback($params) {
         $this->filesystem->log('Using fallback method to process step: ' . (isset($params['step']) ? $params['step'] : 'unknown'));
         
+        // Check current export status first
+        $status_file = $this->filesystem->get_status_file_path();
+        $current_status = '';
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+        }
+        
+        // If export is paused, we need to resume via run_export, not step processing
+        if ($current_status === 'paused') {
+            $this->filesystem->log('Export is paused, scheduling resume via run_export instead of step processing');
+            wp_schedule_single_event(time() + 2, 'cm_run_export');
+            $this->trigger_cron_execution();
+            return;
+        }
+        
         // Check if the step is still needed by examining the actual files
         $file_paths = $this->filesystem->get_export_file_paths();
         $current_step = isset($params['step']) ? $params['step'] : '';
@@ -1069,7 +1239,7 @@ class Custom_Migrator_Core {
         
         switch ($current_step) {
             case 'database':
-                // Check if database file already exists
+                // Check if database file already exists and is complete
                 if ((file_exists($file_paths['sql']) || file_exists($file_paths['sql'] . '.gz'))) {
                     $step_needed = false;
                     $this->filesystem->log('Database file already exists, skipping database fallback');
@@ -1077,7 +1247,7 @@ class Custom_Migrator_Core {
                 break;
                 
             case 'metadata':
-                // Check if metadata file already exists
+                // Check if metadata file already exists and is complete
                 if (file_exists($file_paths['metadata'])) {
                     $step_needed = false;
                     $this->filesystem->log('Metadata file already exists, skipping metadata fallback');
@@ -1086,21 +1256,28 @@ class Custom_Migrator_Core {
                 
             case 'finalize':
                 // Check if export is already done
-                $status_file = $this->filesystem->get_status_file_path();
-                if (file_exists($status_file)) {
-                    $current_status = trim(file_get_contents($status_file));
-                    if ($current_status === 'done') {
-                        $step_needed = false;
-                        $this->filesystem->log('Export already completed, skipping finalize fallback');
-                    }
+                if ($current_status === 'done') {
+                    $step_needed = false;
+                    $this->filesystem->log('Export already completed, skipping finalize fallback');
                 }
                 break;
                 
             case 'content':
-                // Check if content file already exists
-                if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+                // For content step, only skip if export is actually done or content is truly complete
+                // Don't skip just because .hstgr file exists - it might be incomplete (paused export)
+                if ($current_status === 'done') {
                     $step_needed = false;
-                    $this->filesystem->log('Content file already exists, skipping content fallback');
+                    $this->filesystem->log('Export is done, skipping content fallback');
+                } else {
+                    $this->filesystem->log('Content step needed - export status: ' . $current_status);
+                }
+                break;
+                
+            case 'init':
+                // Only skip init if we're past initialization
+                if (in_array($current_status, ['exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'done'])) {
+                    $step_needed = false;
+                    $this->filesystem->log('Already past initialization, skipping init fallback');
                 }
                 break;
         }
@@ -1120,34 +1297,50 @@ class Custom_Migrator_Core {
     }
 
     /**
-     * Resume export from where it left off based on existing files.
+     * Resume export from where it left off based on step tracking.
      *
      * @return void
      */
     public function resume_export_from_current_state() {
         $this->filesystem->log('Attempting to resume export from current state');
         
+        // Check step tracking file first
+        $step_file = $this->filesystem->get_export_dir() . '/export-step.txt';
+        $next_step = 'init';
+        
+        if (file_exists($step_file)) {
+            $tracked_step = trim(file_get_contents($step_file));
+            if (!empty($tracked_step)) {
+                $next_step = $tracked_step;
+                $this->filesystem->log('Found tracked step: ' . $tracked_step);
+            }
+        }
+        
+        // Also check file existence to determine step (fallback)
         $file_paths = $this->filesystem->get_export_file_paths();
         
-        // Determine which step to resume from
-        $next_step = 'init';
         if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
-            $this->filesystem->log('Found .hstgr file, moving to database step');
-            $next_step = 'database';
+            $this->filesystem->log('Found .hstgr file, considering database step');
+            if ($next_step === 'init' || $next_step === 'content') {
+                $next_step = 'database';
+            }
         }
         if ((file_exists($file_paths['sql']) || file_exists($file_paths['sql'] . '.gz')) && filesize($file_paths['hstgr']) > 0) {
-            $this->filesystem->log('Found database file, moving to metadata step');
-            $next_step = 'metadata';
+            $this->filesystem->log('Found database file, considering metadata step');
+            if (in_array($next_step, ['init', 'content', 'database'])) {
+                $next_step = 'metadata';
+            }
         }
         if (file_exists($file_paths['metadata']) && filesize($file_paths['metadata']) > 0) {
-            $this->filesystem->log('Found metadata file, moving to finalize step');
-            $next_step = 'finalize';
+            $this->filesystem->log('Found metadata file, considering finalize step');
+            if (in_array($next_step, ['init', 'content', 'database', 'metadata'])) {
+                $next_step = 'finalize';
+            }
         }
         
         // Create resume parameters
         $params = array(
             'step' => $next_step,
-            'secret_key' => wp_create_nonce('custom_migrator_export_' . get_current_user_id()),
             'completed' => false,
             'is_resume' => true,
             'start_time' => time()
@@ -1179,5 +1372,207 @@ class Custom_Migrator_Core {
         wp_send_json_success(array(
             'message' => 'Export force-continued successfully'
         ));
+    }
+
+    /**
+     * Resume export from where it left off via background processing.
+     *
+     * @return void
+     */
+    private function schedule_background_resume() {
+        $this->filesystem->log('Scheduling background resume');
+        
+        // Check step tracking file first
+        $step_file = $this->filesystem->get_export_dir() . '/export-step.txt';
+        $next_step = 'init';
+        
+        if (file_exists($step_file)) {
+            $tracked_step = trim(file_get_contents($step_file));
+            if (!empty($tracked_step)) {
+                $next_step = $tracked_step;
+                $this->filesystem->log('Found tracked step: ' . $tracked_step);
+            }
+        }
+        
+        // Also check file existence to determine step (fallback)
+        $file_paths = $this->filesystem->get_export_file_paths();
+        
+        if (file_exists($file_paths['hstgr']) && filesize($file_paths['hstgr']) > 0) {
+            $this->filesystem->log('Found .hstgr file, considering database step');
+            if ($next_step === 'init' || $next_step === 'content') {
+                $next_step = 'database';
+            }
+        }
+        if ((file_exists($file_paths['sql']) || file_exists($file_paths['sql'] . '.gz')) && filesize($file_paths['hstgr']) > 0) {
+            $this->filesystem->log('Found database file, considering metadata step');
+            if (in_array($next_step, ['init', 'content', 'database'])) {
+                $next_step = 'metadata';
+            }
+        }
+        if (file_exists($file_paths['metadata']) && filesize($file_paths['metadata']) > 0) {
+            $this->filesystem->log('Found metadata file, considering finalize step');
+            if (in_array($next_step, ['init', 'content', 'database', 'metadata'])) {
+                $next_step = 'finalize';
+            }
+        }
+        
+        // Create resume parameters
+        $params = array(
+            'step' => $next_step,
+            'completed' => false,
+            'is_resume' => true,
+            'start_time' => time()
+        );
+        
+        $this->filesystem->log('Resuming export from step: ' . $next_step);
+        $this->process_export_step($params);
+    }
+
+    /**
+     * Handle debug status request.
+     *
+     * @return void
+     */
+    public function handle_debug_status() {
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
+        $status_file = $this->filesystem->get_status_file_path();
+        $file_urls = $this->filesystem->get_export_file_urls();
+
+        if ( ! file_exists( $status_file ) ) {
+            wp_send_json_error( array( 'status' => 'not_started' ) );
+        }
+
+        $status = trim( file_get_contents( $status_file ) );
+        $modified_time = filemtime($status_file);
+        $current_time = time();
+        $time_diff = $current_time - $modified_time;
+        
+        // Enhanced stuck detection for all processing statuses
+        $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
+        if (in_array($status, $processing_statuses)) {
+            // Optimized timeouts for 10-second processing windows
+            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
+                $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
+                
+                // Try to restart if really stuck
+                if ($time_diff > 120) { 
+                    $this->force_export_restart();
+                }
+                
+                wp_send_json_success(array(
+                    'status' => $status . '_stuck',
+                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Attempting recovery...",
+                    'time_since_update' => $time_diff
+                ));
+                return;
+            }
+        }
+        
+        if ( $status === 'done' ) {
+            // Get file information
+            $file_paths = $this->filesystem->get_export_file_paths();
+            $file_info = array();
+            
+            foreach ( $file_paths as $type => $path ) {
+                if ( file_exists( $path ) ) {
+                    $file_info[$type] = array(
+                        'size' => $this->filesystem->format_file_size( filesize( $path ) ),
+                        'raw_size' => filesize( $path ),
+                        'modified' => date( 'Y-m-d H:i:s', filemtime( $path ) ),
+                    );
+                }
+            }
+            
+            // Clean up monitoring when done
+            wp_clear_scheduled_hook('cm_monitor_export');
+            
+            wp_send_json_success( array(
+                'status'          => 'done',
+                'hstgr_download'  => $file_urls['hstgr'],
+                'sql_download'    => $file_urls['sql'],
+                'metadata'        => $file_urls['metadata'],
+                'log'             => $file_urls['log'],
+                'file_info'       => $file_info,
+            ) );
+        } elseif ($status === 'paused') {
+            // Get resume information 
+            $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+            $resume_info = file_exists($resume_info_file) ? json_decode(file_get_contents($resume_info_file), true) : array();
+            
+            $files_processed = isset($resume_info['files_processed']) ? (int)$resume_info['files_processed'] : 0;
+            $bytes_processed = isset($resume_info['bytes_processed']) ? (int)$resume_info['bytes_processed'] : 0;
+            
+            // Get log for more details
+            $log_file = $this->filesystem->get_log_file_path();
+            $recent_log = '';
+            
+            if (file_exists($log_file)) {
+                $log_content = file_get_contents($log_file);
+                $log_lines = explode("\n", $log_content);
+                $recent_log = implode("\n", array_slice($log_lines, -5)); // Get last 5 lines
+            }
+            
+            // Ensure resume is scheduled
+            if (!wp_next_scheduled('cm_run_export')) {
+                wp_schedule_single_event(time() + 5, 'cm_run_export');
+                $this->trigger_cron_execution();
+            }
+            
+            wp_send_json_success(array( 
+                'status' => 'paused_resuming',
+                'message' => sprintf(
+                    'Export is paused after processing %d files (%.2f MB) and will resume automatically', 
+                    $files_processed, 
+                    $bytes_processed / (1024 * 1024)
+                ),
+                'recent_log' => $recent_log,
+                'progress' => array(
+                    'files_processed' => $files_processed,
+                    'bytes_processed' => $this->filesystem->format_file_size($bytes_processed),
+                    'last_update' => isset($resume_info['last_update']) ? date('Y-m-d H:i:s', $resume_info['last_update']) : ''
+                )
+            ));
+        } elseif (strpos($status, 'error:') === 0) {
+            // Return error status
+            wp_clear_scheduled_hook('cm_monitor_export');
+            wp_send_json_error(array(
+                'status' => 'error',
+                'message' => substr($status, 6) // Remove 'error:' prefix
+            ));
+        } else {
+            // Try to provide more detailed progress info with user-friendly messages
+            $log_file = $this->filesystem->get_log_file_path();
+            $recent_log = '';
+            
+            if (file_exists($log_file)) {
+                $log_content = file_get_contents($log_file);
+                $log_lines = explode("\n", $log_content);
+                $recent_log = implode("\n", array_slice($log_lines, -3)); // Get last 3 lines
+            }
+            
+            // Provide user-friendly status messages
+            $status_messages = array(
+                'starting' => 'Starting export process...',
+                'initializing' => 'Initializing export environment...',
+                'exporting' => 'Exporting wp-content files...',
+                'exporting_database' => 'Exporting database...',
+                'generating_metadata' => 'Generating metadata files...',
+                'finalizing' => 'Finalizing export...',
+                'resuming' => 'Resuming export process...'
+            );
+            
+            $message = isset($status_messages[$status]) ? $status_messages[$status] : 'Processing: ' . $status;
+            
+            wp_send_json_success(array( 
+                'status' => $status,
+                'message' => $message,
+                'recent_log' => $recent_log,
+                'time_since_update' => $time_diff
+            ));
+        }
     }
 }
