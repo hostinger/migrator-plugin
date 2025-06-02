@@ -112,7 +112,7 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Run the export process.
+     * Run the export process with database export protection.
      */
     public function export() {
         $this->setup_execution_environment();
@@ -144,12 +144,17 @@ class Custom_Migrator_Exporter {
                 $this->filesystem->log('Metadata generated successfully');
             }
 
-            if (!$is_resuming && !file_exists($sql_file) && !file_exists($sql_file . '.gz')) {
-                $this->filesystem->log('Exporting database...');
-                $this->database->export($sql_file);
-                $this->filesystem->log('Database exported successfully to ' . basename($sql_file));
-            } else if ($is_resuming) {
-                $this->filesystem->log('Skipping database export as we are resuming content export');
+            // CRITICAL FIX: Only run database export on fresh start, never when resuming file export
+            if (!$is_resuming) {
+                // Fresh start: check if database export is needed
+                if (!$this->is_database_export_complete($sql_file)) {
+                    $this->safe_database_export($sql_file);
+                } else {
+                    $this->filesystem->log('Database export already complete, skipping');
+                }
+            } else {
+                // Resuming: we're only resuming file export, never database export
+                $this->filesystem->log('Resuming file export - database export already complete, skipping');
             }
 
             $this->filesystem->log('Exporting wp-content files...');
@@ -207,49 +212,177 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Export WordPress content files using direct streaming approach.
-     * No CSV intermediary - process files immediately as they're discovered.
+     * Export WordPress content files using optimized single-file processing.
+     * Process one file at a time with immediate timeout checks for better resource management.
      */
     private function export_wp_content_archive($hstgr_file) {
         $wp_content_dir = WP_CONTENT_DIR;
+        $export_dir = $this->filesystem->get_export_dir();
         
-        $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+        $content_list_file = $export_dir . '/content-list.csv';
+        $resume_info_file = $export_dir . '/export-resume-info.json';
         
-        // Load resume data with binary offset tracking
+        // Load resume data with CSV offset tracking
         $resume_data = $this->load_resume_data($resume_info_file);
-        $files_processed = $resume_data['files_processed'];
-        $bytes_processed = $resume_data['bytes_processed'];
-        $last_file_path = $resume_data['last_file_path'] ?? '';
+        $csv_offset = $resume_data['csv_offset'] ?? 0;
         $archive_offset = $resume_data['archive_offset'] ?? 0;
-        $skipped_count = $resume_data['skipped_count'] ?? 0;
+        $files_processed = $resume_data['files_processed'] ?? 0;
+        $bytes_processed = $resume_data['bytes_processed'] ?? 0;
         
-        $is_resuming = $files_processed > 0;
+        $is_resuming = $csv_offset > 0 || $archive_offset > 0;
         
-        if ($is_resuming) {
-            $this->filesystem->log("Resuming direct stream from file: " . basename($last_file_path) . " (processed: $files_processed files)");
-        } else {
-            $this->filesystem->log('Starting direct streaming export');
+        // Step 1: Enumerate files into CSV for efficient processing
+        if (!$is_resuming && !file_exists($content_list_file)) {
+            $this->filesystem->log('Phase 1: Enumerating files into CSV for optimized processing');
+            $this->enumerate_content_files($content_list_file);
         }
         
-        // Open archive in append mode if resuming, write mode if starting fresh
-        $archive_mode = $is_resuming ? 'ab' : 'wb';
+        // Step 2: Process files from CSV (ONE FILE AT A TIME)
+        $this->filesystem->log('Phase 2: Processing files one-by-one for optimal resource usage');
+        
+        // Open CSV file for reading
+        $csv_handle = fopen($content_list_file, 'r');
+        if (!$csv_handle) {
+            throw new Exception('Cannot open content list file');
+        }
+        
+        // Seek to CSV offset if resuming
+        if ($csv_offset > 0) {
+            fseek($csv_handle, $csv_offset);
+        }
+        
+        // Open archive file
+        $archive_mode = $archive_offset > 0 ? 'ab' : 'wb';
         $archive_handle = fopen($hstgr_file, $archive_mode);
         if (!$archive_handle) {
+            fclose($csv_handle);
             throw new Exception('Cannot create or open archive file');
         }
-
-        // If resuming, seek to the correct position
-        if ($is_resuming && $archive_offset > 0) {
+        
+        // Seek to archive offset if resuming
+        if ($archive_offset > 0) {
             fseek($archive_handle, $archive_offset);
         }
-
-        $start_time = time();
-        $batch_start_time = time();
-        $files_in_batch = 0;
-        $should_skip = $is_resuming; // Skip files until we reach resume point
+        
+        // Start precise timing for optimal resource management
+        $start = microtime(true);
+        $completed = true;
         
         try {
-            // Direct iteration - no CSV intermediary
+            // Process files from CSV one at a time for hosting-friendly resource usage
+            while (($file_data = fgetcsv($csv_handle)) !== FALSE) {
+                
+                // Parse CSV data: [file_path, relative_path, size, mtime]
+                if (count($file_data) < 4) continue;
+                
+                $file_path = $file_data[0];
+                $relative_path = $file_data[1];
+                $file_size = (int)$file_data[2];
+                $file_mtime = (int)$file_data[3];
+                
+                // Skip if file no longer exists
+                if (!file_exists($file_path) || !is_readable($file_path)) {
+                    continue;
+                }
+                
+                // Process the file (one at a time for optimal resource usage)
+                $file_info = [
+                    'path' => $file_path,
+                    'relative' => $relative_path,
+                    'size' => $file_size
+                ];
+                
+                $result = $this->add_file_to_archive($archive_handle, $file_info);
+                
+                if ($result['success']) {
+                    $files_processed++;
+                    $bytes_processed += $result['bytes'];
+                    
+                    // Progress logging every 1000 files
+                    if ($files_processed % 1000 === 0) {
+                        $elapsed = microtime(true) - $start;
+                        $rate = $files_processed / max($elapsed, 1);
+                        $this->filesystem->log(sprintf(
+                            "Single-file processing: %d files (%.2f MB). Rate: %.2f files/sec",
+                            $files_processed,
+                            $bytes_processed / (1024 * 1024),
+                            $rate
+                        ));
+                    }
+                }
+                
+                // Check timeout immediately after each file for hosting compatibility
+                if (($timeout = apply_filters('ai1wm_completed_timeout', 10))) {
+                    if ((microtime(true) - $start) > $timeout) {
+                        $this->filesystem->log("Pausing after processing $files_processed files (optimal timing)");
+                        
+                        // Save CSV and archive positions for precise resume
+                        $current_csv_offset = ftell($csv_handle);
+                        $current_archive_offset = ftell($archive_handle);
+                        
+                        $this->save_resume_data($resume_info_file, [
+                            'csv_offset' => $current_csv_offset,
+                            'archive_offset' => $current_archive_offset,
+                            'files_processed' => $files_processed,
+                            'bytes_processed' => $bytes_processed,
+                            'last_update' => time()
+                        ]);
+                        
+                        $completed = false;
+                        break; // Pause immediately for hosting compatibility
+                    }
+                }
+            }
+            
+        } catch (Exception $e) {
+            fclose($csv_handle);
+            fclose($archive_handle);
+            throw new Exception('Single-file processing failed: ' . $e->getMessage());
+        }
+        
+        fclose($csv_handle);
+        fclose($archive_handle);
+        
+        // If not completed, schedule immediate resume and exit
+        if (!$completed) {
+            $this->filesystem->write_status('paused');
+            $this->schedule_immediate_resume();
+        } else {
+            // Clean up files when completed
+            if (file_exists($content_list_file)) {
+                @unlink($content_list_file);
+            }
+            if (file_exists($resume_info_file)) {
+                @unlink($resume_info_file);
+            }
+            
+            $total_time = microtime(true) - $start;
+            $this->filesystem->log(sprintf(
+                "Single-file processing completed: %d files (%.2f MB) in %.2f seconds",
+                $files_processed,
+                $bytes_processed / (1024 * 1024),
+                $total_time
+            ));
+        }
+        
+        return $completed ? true : 'paused';
+    }
+
+    /**
+     * Enumerate content files into CSV for efficient processing.
+     */
+    private function enumerate_content_files($content_list_file) {
+        $wp_content_dir = WP_CONTENT_DIR;
+        
+        $this->filesystem->log('Enumerating files into CSV...');
+        
+        $csv_handle = fopen($content_list_file, 'w');
+        if (!$csv_handle) {
+            throw new Exception('Cannot create content list file');
+        }
+        
+        try {
+            // Use efficient directory iteration
             $directory_iterator = new RecursiveDirectoryIterator(
                 $wp_content_dir, 
                 RecursiveDirectoryIterator::SKIP_DOTS 
@@ -260,138 +393,45 @@ class Custom_Migrator_Exporter {
                 RecursiveIteratorIterator::LEAVES_ONLY
             );
 
+            $file_count = 0;
             foreach ($iterator as $file) {
-                // Check for pause conditions much less frequently (every 1000 files)
-                if ($files_in_batch % 1000 === 0) {
-                    if ($this->should_pause_processing($start_time, $batch_start_time, $files_in_batch)) {
-                        $this->filesystem->log("Pausing after processing $files_processed files (direct streaming)");
-                        
-                        // Save current position for resume
-                        $current_offset = ftell($archive_handle);
-                        $this->save_resume_data($resume_info_file, [
-                            'files_processed' => $files_processed,
-                            'skipped_count' => $skipped_count,
-                            'bytes_processed' => $bytes_processed,
-                            'last_file_path' => $file->getRealPath(),
-                            'archive_offset' => $current_offset,
-                            'last_update' => time()
-                        ]);
-                        
-                        fclose($archive_handle);
-                        $this->filesystem->write_status('paused');
-                        
-                        // Schedule immediate resume and exit immediately (All-in-One WP Migration approach)
-                        $this->schedule_immediate_resume();
-                        
-                        // Exit immediately after HTTP request like All-in-One WP Migration
-                        exit();
-                    }
-                }
-                
                 if (!$file->isFile()) {
                     continue;
                 }
                 
                 $real_path = $file->getRealPath();
                 
-                // Skip files if we're resuming and haven't reached the resume point yet
-                if ($should_skip) {
-                    if ($real_path === $last_file_path) {
-                        $should_skip = false; // Found resume point, start processing next file
-                        $this->filesystem->log("Reached resume point: " . basename($last_file_path));
-                    }
-                    continue;
-                }
-                
                 // Check exclusions
                 if ($this->is_file_excluded($real_path)) {
-                    $skipped_count++;
                     continue;
                 }
                 
-                // Process file immediately (no CSV storage)
+                // Get file stats
+                $file_size = filesize($real_path);
+                $file_mtime = filemtime($real_path);
                 $relative_path = 'wp-content/' . substr($real_path, strlen($wp_content_dir) + 1);
                 
-                // Validate file before processing
-                if (!is_readable($real_path)) {
-                    $this->filesystem->log("Warning: File not readable, skipping: " . basename($real_path));
-                    $skipped_count++;
+                if ($file_size === false || $file_mtime === false) {
                     continue;
                 }
                 
-                // Get file size safely
-                $file_size = filesize($real_path);
-                if ($file_size === false) {
-                    $this->filesystem->log("Warning: Cannot get file size, skipping: " . basename($real_path));
-                    $skipped_count++;
-                    continue;
-                }
+                // Write to CSV: [absolute_path, relative_path, size, mtime]
+                fputcsv($csv_handle, [$real_path, $relative_path, $file_size, $file_mtime]);
+                $file_count++;
                 
-                $file_info = [
-                    'path' => $real_path,
-                    'relative' => $relative_path,
-                    'size' => $file_size
-                ];
-                
-                $result = $this->add_file_to_archive($archive_handle, $file_info);
-                
-                if (!$result['success']) {
-                    $this->filesystem->log("Warning: Failed to archive file: " . basename($real_path) . " - continuing with next file");
-                    $skipped_count++;
-                    continue;
-                }
-                
-                // Verify file was written correctly
-                if ($result['bytes'] !== $file_size) {
-                    $this->filesystem->log("Warning: File size mismatch for: " . basename($real_path) . " (expected: $file_size, written: {$result['bytes']})");
-                }
-
-                $files_processed++;
-                $bytes_processed += $result['bytes'];
-                $files_in_batch++;
-                
-                // Progress logging every 5000 files (like All-in-One WP Migration)
-                if ($files_processed % 5000 === 0) {
-                    $elapsed = time() - $start_time;
-                    $rate = $files_processed / max($elapsed, 1);
-                    $bytes_rate = ($bytes_processed / max($elapsed, 1)) / (1024 * 1024);
-                    $this->filesystem->log(sprintf(
-                        "Direct streaming: %d files (%.2f MB). Rate: %.2f files/sec (%.2f MB/s)",
-                        $files_processed,
-                        $bytes_processed / (1024 * 1024),
-                        $rate,
-                        $bytes_rate
-                    ));
-                }
-                
-                // Minimal I/O throttling - only every 1000 files  
-                if ($files_in_batch % 1000 === 0) {
-                    usleep(10000); // 0.01 second pause only
+                // Progress every 5000 files
+                if ($file_count % 5000 === 0) {
+                    $this->filesystem->log("Enumerated $file_count files...");
                 }
             }
             
         } catch (Exception $e) {
-            fclose($archive_handle);
-            throw new Exception('Direct streaming failed: ' . $e->getMessage());
+            fclose($csv_handle);
+            throw new Exception('File enumeration failed: ' . $e->getMessage());
         }
         
-        fclose($archive_handle);
-        
-        // Clean up resume file when completed
-        if (file_exists($resume_info_file)) {
-            @unlink($resume_info_file);
-        }
-        
-        $total_time = time() - $start_time;
-        $this->filesystem->log(sprintf(
-            "Direct streaming completed: %d files (%.2f MB) in %d seconds, skipped %d files",
-            $files_processed,
-            $bytes_processed / (1024 * 1024),
-            $total_time,
-            $skipped_count
-        ));
-        
-        return true;
+        fclose($csv_handle);
+        $this->filesystem->log("File enumeration complete: $file_count files");
     }
 
     /**
@@ -503,51 +543,36 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Check if processing should be paused.
+     * Check if processing should be paused (optimized timeout pattern).
+     * This function is no longer used since we check timeout directly in the main loop.
      */
     private function should_pause_processing($start_time, $batch_start_time, $files_in_batch) {
-        // Check 10-second execution time limit
-        if ((time() - $start_time) >= self::MAX_EXECUTION_TIME) {
-            return true;
-        }
+        // NOTE: This function is kept for compatibility but not used anymore.
+        // We now use optimized pattern: apply_filters('ai1wm_completed_timeout', 10)
+        // and check timeout immediately after each file in the main loop.
         
-        // Check memory threshold (more aggressive)
-        $memory_usage = memory_get_usage(true);
-        $memory_limit = $this->get_memory_limit_bytes();
-        if ($memory_usage > ($memory_limit * self::MEMORY_THRESHOLD)) {
-            $this->filesystem->log('Memory threshold reached: ' . $this->format_bytes($memory_usage) . ' / ' . $this->format_bytes($memory_limit));
-            return true;
-        }
-        
-        // Pause if we've processed enough files in current batch (smaller batches)
-        if ($files_in_batch >= self::BATCH_SIZE) {
-            return true;
-        }
-        
-        return false;
+        return false; // Never called in the new single-file approach
     }
 
     /**
-     * Load resume data with binary offset tracking.
+     * Load resume data with CSV offset tracking.
      */
     private function load_resume_data($resume_info_file) {
         if (!file_exists($resume_info_file)) {
             return [
+                'csv_offset' => 0,
+                'archive_offset' => 0,
                 'files_processed' => 0,
-                'bytes_processed' => 0,
-                'skipped_count' => 0,
-                'last_file_path' => '',
-                'archive_offset' => 0
+                'bytes_processed' => 0
             ];
         }
         
         $data = json_decode(file_get_contents($resume_info_file), true);
         return $data ?: [
+            'csv_offset' => 0,
+            'archive_offset' => 0,
             'files_processed' => 0,
-            'bytes_processed' => 0,
-            'skipped_count' => 0,
-            'last_file_path' => '',
-            'archive_offset' => 0
+            'bytes_processed' => 0
         ];
     }
 
@@ -654,7 +679,7 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Export only database (step 3 of step-by-step export).
+     * Export only database (step 3 of step-by-step export) with protection.
      * 
      * @return bool Success status.
      */
@@ -664,14 +689,13 @@ class Custom_Migrator_Exporter {
         $file_paths = $this->filesystem->get_export_file_paths();
         $sql_file = $file_paths['sql'];
         
-        // Check if database file already exists
-        if (file_exists($sql_file) || file_exists($sql_file . '.gz')) {
-            $this->filesystem->log('Database file already exists, skipping');
-            return true;
+        // Use the same safe database export mechanism
+        if (!$this->is_database_export_complete($sql_file)) {
+            $this->safe_database_export($sql_file);
+        } else {
+            $this->filesystem->log('Database export already complete, skipping');
         }
         
-        $this->database->export($sql_file);
-        $this->filesystem->log('Database export completed');
         return true;
     }
 
@@ -702,7 +726,7 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Schedule immediate resume (simple approach, no secret keys).
+     * Schedule immediate resume (optimized background processing).
      */
     private function schedule_immediate_resume() {
         $ajax_url = admin_url('admin-ajax.php');
@@ -711,23 +735,30 @@ class Custom_Migrator_Exporter {
             'background_mode' => '1'
         );
         
-        // Method 1: Immediate HTTP request
+        // Method 1: Non-blocking request (don't wait for response)
+        wp_remote_post($ajax_url, array(
+            'method'    => 'POST',
+            'timeout'   => 0.01,  // Very short timeout
+            'blocking'  => false, // Non-blocking so we can exit immediately
+            'sslverify' => false,
+            'headers'   => array('Connection' => 'close'),
+            'body'      => $request_params,
+        ));
+        
+        // Method 2: Additional non-blocking request as backup
         wp_remote_post($ajax_url, array(
             'method'    => 'POST',
             'timeout'   => 10,
             'blocking'  => false,
             'sslverify' => false,
-            'headers'   => array(),
             'body'      => $request_params,
         ));
         
-        $this->filesystem->log('Initiated immediate resume via HTTP POST (no secret keys)');
+        $this->filesystem->log('Sent immediate resume requests - exiting to allow new request');
         
-        // Method 2: Backup cron scheduling  
-        wp_schedule_single_event(time() + 1, 'cm_run_export');
-        wp_schedule_single_event(time() + 3, 'cm_run_export');
-        
-        $this->filesystem->log('Scheduled multiple resume methods for reliability');
+        // Optimized pattern: Exit immediately after sending HTTP request
+        // This ensures the current request ends and the new request can start immediately
+        exit();
     }
 
     /**
@@ -757,5 +788,122 @@ class Custom_Migrator_Exporter {
         );
         
         wp_remote_get($url, $args);
+    }
+
+    /**
+     * Check if database export is complete and valid.
+     */
+    private function is_database_export_complete($sql_file) {
+        // Only check the EXACT current database file, not old ones from previous exports
+        
+        // Method 1: Check if the exact compressed file exists and has content
+        if (file_exists($sql_file . '.gz') && filesize($sql_file . '.gz') > 1024) {
+            $this->filesystem->log('Current database export found: ' . basename($sql_file . '.gz') . ' (' . $this->format_bytes(filesize($sql_file . '.gz')) . ')');
+            return true;
+        }
+        
+        // Method 2: Check if the exact uncompressed file exists and is complete
+        if (file_exists($sql_file) && filesize($sql_file) > 1024) {
+            // Read last 1024 bytes to check for completion marker
+            $handle = fopen($sql_file, 'r');
+            if ($handle) {
+                fseek($handle, -1024, SEEK_END);
+                $tail = fread($handle, 1024);
+                fclose($handle);
+                
+                // Look for SQL completion markers
+                if (strpos($tail, '-- Export completed') !== false || 
+                    strpos($tail, 'COMMIT;') !== false ||
+                    strpos($tail, '/*!40101 SET') !== false) {
+                    $this->filesystem->log('Current database export found: ' . basename($sql_file) . ' (' . $this->format_bytes(filesize($sql_file)) . ')');
+                    return true;
+                }
+            }
+        }
+        
+        $this->filesystem->log('No current database export found - need to create: ' . basename($sql_file));
+        return false;
+    }
+
+    /**
+     * Safely export database with lock mechanism to prevent parallel exports.
+     */
+    private function safe_database_export($sql_file) {
+        $export_dir = $this->filesystem->get_export_dir();
+        $lock_file = $export_dir . '/database-export.lock';
+        $status_file = $export_dir . '/database-export-status.json';
+        
+        // Check if another process is already exporting database
+        if (file_exists($lock_file)) {
+            $lock_time = filemtime($lock_file);
+            $current_time = time();
+            
+            // If lock is older than 5 minutes, consider it stale
+            if (($current_time - $lock_time) > 300) {
+                $this->filesystem->log('Removing stale database export lock (older than 5 minutes)');
+                @unlink($lock_file);
+                @unlink($status_file);
+            } else {
+                // Check if database export is actually running
+                if (file_exists($status_file)) {
+                    $status = json_decode(file_get_contents($status_file), true);
+                    $progress_time = $status['last_update'] ?? 0;
+                    
+                    // If no progress in last 2 minutes, consider it stuck
+                    if (($current_time - $progress_time) > 120) {
+                        $this->filesystem->log('Database export appears stuck, removing lock');
+                        @unlink($lock_file);
+                        @unlink($status_file);
+                    } else {
+                        $this->filesystem->log('Database export already in progress by another process, waiting...');
+                        return;
+                    }
+                } else {
+                    $this->filesystem->log('Database export lock exists but no status file, removing lock');
+                    @unlink($lock_file);
+                }
+            }
+        }
+        
+        // Create lock file to claim database export
+        file_put_contents($lock_file, time());
+        file_put_contents($status_file, json_encode([
+            'started' => time(),
+            'last_update' => time(),
+            'pid' => getmypid()
+        ]));
+        
+        try {
+            $this->filesystem->log('Starting protected database export');
+            
+            // Update status before starting
+            $this->update_database_export_status($status_file, 'starting');
+            
+            $this->database->export($sql_file);
+            
+            // Update status after completion
+            $this->update_database_export_status($status_file, 'completed');
+            $this->filesystem->log('Database exported successfully to ' . basename($sql_file));
+            
+        } catch (Exception $e) {
+            $this->filesystem->log('Database export failed: ' . $e->getMessage());
+            throw $e;
+        } finally {
+            // Always clean up lock files
+            @unlink($lock_file);
+            @unlink($status_file);
+        }
+    }
+
+    /**
+     * Update database export status.
+     */
+    private function update_database_export_status($status_file, $status) {
+        if (file_exists($status_file)) {
+            $current_status = json_decode(file_get_contents($status_file), true);
+            $current_status['status'] = $status;
+            $current_status['last_update'] = time();
+            file_put_contents($status_file, json_encode($current_status));
+        }
     }
 }
