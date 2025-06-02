@@ -46,7 +46,7 @@ class Custom_Migrator_Exporter {
     private $exclusion_paths = [];
 
     /**
-     * Block format for binary archive (optimized like All-in-One WP Migration)
+     * Block format for binary archive with optimized structure
      * 
      * @var array
      */
@@ -56,11 +56,12 @@ class Custom_Migrator_Exporter {
     ];
 
     /**
-     * Batch processing constants.
+     * Batch processing constants - Optimized for responsiveness.
      */
-    const BATCH_SIZE = 100;
-    const MAX_EXECUTION_TIME = 240;
-    const MEMORY_THRESHOLD = 0.8;
+    const BATCH_SIZE = 1000;            // Reduced from 10,000 to 1,000 for faster resume
+    const MAX_EXECUTION_TIME = 10;      // 10 seconds like All-in-One WP Migration  
+    const MEMORY_THRESHOLD = 0.9;       // More aggressive memory usage
+    const CHUNK_SIZE = 512000;          // 512KB chunks like All-in-One
 
     /**
      * Initialize the class.
@@ -206,125 +207,184 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Export WordPress content files using structured binary archive with CSV streaming.
+     * Export WordPress content files using direct streaming approach.
+     * No CSV intermediary - process files immediately as they're discovered.
      */
     private function export_wp_content_archive($hstgr_file) {
         $wp_content_dir = WP_CONTENT_DIR;
         
         $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
-        $file_list_csv = $this->filesystem->get_export_dir() . '/file-list.csv';
         
+        // Load resume data with binary offset tracking
         $resume_data = $this->load_resume_data($resume_info_file);
         $files_processed = $resume_data['files_processed'];
         $bytes_processed = $resume_data['bytes_processed'];
-        $csv_position = $resume_data['csv_position'] ?? 0;
+        $last_file_path = $resume_data['last_file_path'] ?? '';
+        $archive_offset = $resume_data['archive_offset'] ?? 0;
         $skipped_count = $resume_data['skipped_count'] ?? 0;
         
-        if ($files_processed > 0) {
-            $this->filesystem->log("Resuming export from file " . $files_processed . ", CSV position: " . $csv_position);
+        $is_resuming = $files_processed > 0;
+        
+        if ($is_resuming) {
+            $this->filesystem->log("Resuming direct stream from file: " . basename($last_file_path) . " (processed: $files_processed files)");
+        } else {
+            $this->filesystem->log('Starting direct streaming export');
         }
         
-        // Build/load CSV file list (memory efficient)
-        if (!file_exists($file_list_csv) || $csv_position === 0) {
-            $this->filesystem->log('Building CSV file list...');
-            $total_files = $this->build_csv_file_list($wp_content_dir, $file_list_csv);
-            $this->filesystem->log('CSV file list built: ' . $total_files . ' files');
-        }
-        
-        $append_mode = $files_processed > 0 ? 'ab' : 'wb';
-        
-        $archive_handle = fopen($hstgr_file, $append_mode);
+        // Open archive in append mode if resuming, write mode if starting fresh
+        $archive_mode = $is_resuming ? 'ab' : 'wb';
+        $archive_handle = fopen($hstgr_file, $archive_mode);
         if (!$archive_handle) {
             throw new Exception('Cannot create or open archive file');
         }
 
-        // Stream CSV file instead of loading into memory
-        $csv_handle = fopen($file_list_csv, 'r');
-        if (!$csv_handle) {
-            throw new Exception('Cannot open CSV file list');
-        }
-        
-        // Skip to resume position
-        if ($csv_position > 0) {
-            fseek($csv_handle, $csv_position);
+        // If resuming, seek to the correct position
+        if ($is_resuming && $archive_offset > 0) {
+            fseek($archive_handle, $archive_offset);
         }
 
-        $start_time = microtime(true);
-        $batch_start_time = microtime(true);
+        $start_time = time();
+        $batch_start_time = time();
         $files_in_batch = 0;
-        $execution_start = time();
-        $current_csv_position = $csv_position;
+        $should_skip = $is_resuming; // Skip files until we reach resume point
         
-        while (($csv_line = fgets($csv_handle)) !== false) {
-            $current_csv_position = ftell($csv_handle);
+        try {
+            // Direct iteration - no CSV intermediary
+            $directory_iterator = new RecursiveDirectoryIterator(
+                $wp_content_dir, 
+                RecursiveDirectoryIterator::SKIP_DOTS 
+            );
             
-            if ($this->should_pause_processing($execution_start, $batch_start_time, $files_in_batch)) {
-                $this->filesystem->log("Approaching resource limit, saving state after processing $files_processed files");
+            $iterator = new RecursiveIteratorIterator(
+                $directory_iterator,
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+
+            foreach ($iterator as $file) {
+                // Check for pause conditions much less frequently (every 1000 files)
+                if ($files_in_batch % 1000 === 0) {
+                    if ($this->should_pause_processing($start_time, $batch_start_time, $files_in_batch)) {
+                        $this->filesystem->log("Pausing after processing $files_processed files (direct streaming)");
+                        
+                        // Save current position for resume
+                        $current_offset = ftell($archive_handle);
+                        $this->save_resume_data($resume_info_file, [
+                            'files_processed' => $files_processed,
+                            'skipped_count' => $skipped_count,
+                            'bytes_processed' => $bytes_processed,
+                            'last_file_path' => $file->getRealPath(),
+                            'archive_offset' => $current_offset,
+                            'last_update' => time()
+                        ]);
+                        
+                        fclose($archive_handle);
+                        $this->filesystem->write_status('paused');
+                        
+                        // Schedule immediate resume and exit immediately (All-in-One WP Migration approach)
+                        $this->schedule_immediate_resume();
+                        
+                        // Exit immediately after HTTP request like All-in-One WP Migration
+                        exit();
+                    }
+                }
                 
-                $this->save_resume_data($resume_info_file, [
-                    'files_processed' => $files_processed,
-                    'skipped_count' => $skipped_count,
-                    'bytes_processed' => $bytes_processed,
-                    'csv_position' => $current_csv_position,
-                    'last_update' => time()
-                ]);
+                if (!$file->isFile()) {
+                    continue;
+                }
                 
-                fclose($archive_handle);
-                fclose($csv_handle);
+                $real_path = $file->getRealPath();
                 
-                $this->filesystem->write_status('paused');
-                wp_schedule_single_event(time() + 5, 'cm_run_export');
+                // Skip files if we're resuming and haven't reached the resume point yet
+                if ($should_skip) {
+                    if ($real_path === $last_file_path) {
+                        $should_skip = false; // Found resume point, start processing next file
+                        $this->filesystem->log("Reached resume point: " . basename($last_file_path));
+                    }
+                    continue;
+                }
                 
-                return 'paused';
-            }
-            
-            // Parse CSV line: path,relative,size
-            $file_data = str_getcsv(trim($csv_line));
-            if (count($file_data) !== 3) {
-                continue;
-            }
-            
-            $file_info = [
-                'path' => $file_data[0],
-                'relative' => $file_data[1],
-                'size' => (int)$file_data[2]
-            ];
-            
-            if ($this->is_file_excluded($file_info['path'])) {
-                $skipped_count++;
-                continue;
-            }
-            
-            $result = $this->add_file_to_archive($archive_handle, $file_info);
-            if ($result['success']) {
+                // Check exclusions
+                if ($this->is_file_excluded($real_path)) {
+                    $skipped_count++;
+                    continue;
+                }
+                
+                // Process file immediately (no CSV storage)
+                $relative_path = 'wp-content/' . substr($real_path, strlen($wp_content_dir) + 1);
+                
+                // Validate file before processing
+                if (!is_readable($real_path)) {
+                    $this->filesystem->log("Warning: File not readable, skipping: " . basename($real_path));
+                    $skipped_count++;
+                    continue;
+                }
+                
+                // Get file size safely
+                $file_size = filesize($real_path);
+                if ($file_size === false) {
+                    $this->filesystem->log("Warning: Cannot get file size, skipping: " . basename($real_path));
+                    $skipped_count++;
+                    continue;
+                }
+                
+                $file_info = [
+                    'path' => $real_path,
+                    'relative' => $relative_path,
+                    'size' => $file_size
+                ];
+                
+                $result = $this->add_file_to_archive($archive_handle, $file_info);
+                
+                if (!$result['success']) {
+                    $this->filesystem->log("Warning: Failed to archive file: " . basename($real_path) . " - continuing with next file");
+                    $skipped_count++;
+                    continue;
+                }
+                
+                // Verify file was written correctly
+                if ($result['bytes'] !== $file_size) {
+                    $this->filesystem->log("Warning: File size mismatch for: " . basename($real_path) . " (expected: $file_size, written: {$result['bytes']})");
+                }
+
                 $files_processed++;
                 $bytes_processed += $result['bytes'];
                 $files_in_batch++;
                 
-                if ($files_processed % 500 === 0) {
-                    $elapsed = microtime(true) - $start_time;
+                // Progress logging every 5000 files (like All-in-One WP Migration)
+                if ($files_processed % 5000 === 0) {
+                    $elapsed = time() - $start_time;
                     $rate = $files_processed / max($elapsed, 1);
                     $bytes_rate = ($bytes_processed / max($elapsed, 1)) / (1024 * 1024);
                     $this->filesystem->log(sprintf(
-                        "Processed %d files (%.2f MB). Rate: %.2f files/sec (%.2f MB/s)",
+                        "Direct streaming: %d files (%.2f MB). Rate: %.2f files/sec (%.2f MB/s)",
                         $files_processed,
                         $bytes_processed / (1024 * 1024),
                         $rate,
                         $bytes_rate
                     ));
                 }
+                
+                // Minimal I/O throttling - only every 1000 files  
+                if ($files_in_batch % 1000 === 0) {
+                    usleep(10000); // 0.01 second pause only
+                }
             }
+            
+        } catch (Exception $e) {
+            fclose($archive_handle);
+            throw new Exception('Direct streaming failed: ' . $e->getMessage());
         }
         
         fclose($archive_handle);
-        fclose($csv_handle);
         
-        // Clean up CSV file when done
-        @unlink($file_list_csv);
+        // Clean up resume file when completed
+        if (file_exists($resume_info_file)) {
+            @unlink($resume_info_file);
+        }
         
-        $total_time = microtime(true) - $start_time;
+        $total_time = time() - $start_time;
         $this->filesystem->log(sprintf(
-            "Exported %d files (%.2f MB) in %.2f seconds, skipped %d files",
+            "Direct streaming completed: %d files (%.2f MB) in %d seconds, skipped %d files",
             $files_processed,
             $bytes_processed / (1024 * 1024),
             $total_time,
@@ -342,13 +402,29 @@ class Custom_Migrator_Exporter {
         $relative_path = $file_info['relative'];
         $file_size = $file_info['size'];
         
-        if (!file_exists($file_path) || !is_readable($file_path)) {
+        // Enhanced file validation
+        if (!file_exists($file_path)) {
+            $this->filesystem->log("File disappeared during processing: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
+        }
+        
+        if (!is_readable($file_path)) {
+            $this->filesystem->log("File became unreadable: " . basename($file_path));
+            return ['success' => false, 'bytes' => 0];
+        }
+        
+        // Re-check file size (files can change during processing)
+        $current_size = filesize($file_path);
+        if ($current_size !== $file_size) {
+            $this->filesystem->log("File size changed during processing: " . basename($file_path) . " (was: $file_size, now: $current_size) - using current size");
+            $file_size = $current_size;
+            $file_info['size'] = $file_size; // Update for consistency
         }
         
         // Get file stats
         $stat = stat($file_path);
         if ($stat === false) {
+            $this->filesystem->log("Cannot get file stats: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
         }
         
@@ -372,107 +448,70 @@ class Custom_Migrator_Exporter {
         // Verify block size is correct
         $expected_size = 255 + 4 + 4 + 4112; // 4375 bytes
         if (strlen($block) !== $expected_size) {
-            $this->filesystem->log("Warning: Binary block size mismatch for {$file_name}. Expected: {$expected_size}, Got: " . strlen($block));
+            $this->filesystem->log("Error: Binary block size mismatch for {$file_name}. Expected: {$expected_size}, Got: " . strlen($block));
             return ['success' => false, 'bytes' => 0];
         }
         
-        // Write the header block
-        if (fwrite($archive_handle, $block) === false) {
+        // Write the header block with verification
+        $header_written = fwrite($archive_handle, $block);
+        if ($header_written === false || $header_written !== $expected_size) {
+            $this->filesystem->log("Error: Failed to write header block for {$file_name}");
             return ['success' => false, 'bytes' => 0];
         }
         
-        // Open and copy file content
+        // Open and copy file content with verification
         $file_handle = fopen($file_path, 'rb');
         if (!$file_handle) {
+            $this->filesystem->log("Error: Cannot open file for reading: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
         }
         
-        $bytes_written = 0;
-        $buffer_size = 512000; // 512KB buffer like All-in-One
+        $bytes_copied = 0;
+        $chunk_size = self::CHUNK_SIZE; // 512KB chunks
         
         while (!feof($file_handle)) {
-            $content = fread($file_handle, $buffer_size);
-            if ($content === false) {
-                break;
+            $chunk = fread($file_handle, $chunk_size);
+            if ($chunk === false) {
+                $this->filesystem->log("Error: Failed to read from file: " . basename($file_path));
+                fclose($file_handle);
+                return ['success' => false, 'bytes' => $bytes_copied];
             }
             
-            $written = fwrite($archive_handle, $content);
-            if ($written === false || $written !== strlen($content)) {
-                $this->filesystem->log("Error writing file content: " . $file_path);
-                break;
+            $chunk_length = strlen($chunk);
+            if ($chunk_length === 0) {
+                break; // End of file
             }
             
-            $bytes_written += $written;
+            $written = fwrite($archive_handle, $chunk);
+            if ($written === false || $written !== $chunk_length) {
+                $this->filesystem->log("Error: Failed to write chunk for file: " . basename($file_path));
+                fclose($file_handle);
+                return ['success' => false, 'bytes' => $bytes_copied];
+            }
+            
+            $bytes_copied += $written;
         }
         
         fclose($file_handle);
         
-        return ['success' => true, 'bytes' => $file_size];
-    }
-
-    /**
-     * Build CSV file list (memory efficient streaming).
-     */
-    private function build_csv_file_list($wp_content_dir, $file_list_csv) {
-        $csv_handle = fopen($file_list_csv, 'w');
-        if (!$csv_handle) {
-            throw new Exception('Cannot create CSV file list');
+        // Final verification - ensure we copied the expected amount
+        if ($bytes_copied !== $file_size) {
+            $this->filesystem->log("Warning: Bytes copied ($bytes_copied) doesn't match file size ($file_size) for: " . basename($file_path));
         }
         
-        $file_count = 0;
-        
-        try {
-            $directory_iterator = new RecursiveDirectoryIterator(
-                $wp_content_dir, 
-                RecursiveDirectoryIterator::SKIP_DOTS 
-            );
-            
-            $iterator = new RecursiveIteratorIterator(
-                $directory_iterator,
-                RecursiveIteratorIterator::LEAVES_ONLY
-            );
-
-            foreach ($iterator as $file) {
-                if ($file->isFile()) {
-                    $real_path = $file->getRealPath();
-                    $relative_path = 'wp-content/' . substr($real_path, strlen($wp_content_dir) + 1);
-                    
-                    // Write directly to CSV (memory efficient)
-                    fputcsv($csv_handle, [
-                        $real_path,
-                        $relative_path,
-                        $file->getSize()
-                    ]);
-                    
-                    $file_count++;
-                    
-                    // Periodic memory cleanup for very large sites
-                    if ($file_count % 1000 === 0) {
-                        if (function_exists('gc_collect_cycles')) {
-                            gc_collect_cycles();
-                        }
-                    }
-                }
-            }
-        } catch (Exception $e) {
-            fclose($csv_handle);
-            $this->filesystem->log('Error building CSV file list: ' . $e->getMessage());
-            throw new Exception('Failed to build CSV file list: ' . $e->getMessage());
-        }
-        
-        fclose($csv_handle);
-        
-        return $file_count;
+        return ['success' => true, 'bytes' => $bytes_copied];
     }
 
     /**
      * Check if processing should be paused.
      */
     private function should_pause_processing($start_time, $batch_start_time, $files_in_batch) {
-        if ((time() - $start_time) > self::MAX_EXECUTION_TIME) {
+        // Check 10-second execution time limit
+        if ((time() - $start_time) >= self::MAX_EXECUTION_TIME) {
             return true;
         }
         
+        // Check memory threshold (more aggressive)
         $memory_usage = memory_get_usage(true);
         $memory_limit = $this->get_memory_limit_bytes();
         if ($memory_usage > ($memory_limit * self::MEMORY_THRESHOLD)) {
@@ -480,7 +519,8 @@ class Custom_Migrator_Exporter {
             return true;
         }
         
-        if ($files_in_batch >= self::BATCH_SIZE && (microtime(true) - $batch_start_time) > 30) {
+        // Pause if we've processed enough files in current batch (smaller batches)
+        if ($files_in_batch >= self::BATCH_SIZE) {
             return true;
         }
         
@@ -488,7 +528,7 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Load resume data.
+     * Load resume data with binary offset tracking.
      */
     private function load_resume_data($resume_info_file) {
         if (!file_exists($resume_info_file)) {
@@ -496,7 +536,8 @@ class Custom_Migrator_Exporter {
                 'files_processed' => 0,
                 'bytes_processed' => 0,
                 'skipped_count' => 0,
-                'csv_position' => 0
+                'last_file_path' => '',
+                'archive_offset' => 0
             ];
         }
         
@@ -505,7 +546,8 @@ class Custom_Migrator_Exporter {
             'files_processed' => 0,
             'bytes_processed' => 0,
             'skipped_count' => 0,
-            'csv_position' => 0
+            'last_file_path' => '',
+            'archive_offset' => 0
         ];
     }
 
@@ -585,7 +627,7 @@ class Custom_Migrator_Exporter {
     /**
      * Export only wp-content files (step 2 of step-by-step export).
      * 
-     * @return bool Success status.
+     * @return mixed Success status (true), paused status ('paused'), or false on error.
      */
     public function export_content_only() {
         $this->filesystem->log('Starting wp-content export step');
@@ -604,7 +646,7 @@ class Custom_Migrator_Exporter {
         
         if ($content_export_result === 'paused') {
             $this->filesystem->log('wp-content export paused, will continue in next step');
-            return false; // Not complete yet
+            return 'paused'; // Return paused status instead of false
         }
         
         $this->filesystem->log('wp-content export completed');
@@ -657,5 +699,63 @@ class Custom_Migrator_Exporter {
         file_put_contents($meta_file, wp_json_encode($meta, JSON_PRETTY_PRINT));
         $this->filesystem->log('Metadata generation completed');
         return true;
+    }
+
+    /**
+     * Schedule immediate resume (simple approach, no secret keys).
+     */
+    private function schedule_immediate_resume() {
+        $ajax_url = admin_url('admin-ajax.php');
+        $request_params = array(
+            'action' => 'cm_run_export_now',
+            'background_mode' => '1'
+        );
+        
+        // Method 1: Immediate HTTP request
+        wp_remote_post($ajax_url, array(
+            'method'    => 'POST',
+            'timeout'   => 10,
+            'blocking'  => false,
+            'sslverify' => false,
+            'headers'   => array(),
+            'body'      => $request_params,
+        ));
+        
+        $this->filesystem->log('Initiated immediate resume via HTTP POST (no secret keys)');
+        
+        // Method 2: Backup cron scheduling  
+        wp_schedule_single_event(time() + 1, 'cm_run_export');
+        wp_schedule_single_event(time() + 3, 'cm_run_export');
+        
+        $this->filesystem->log('Scheduled multiple resume methods for reliability');
+    }
+
+    /**
+     * Trigger cron execution.
+     */
+    private function trigger_cron_execution() {
+        // Method 1: Standard WordPress spawn_cron
+        if (function_exists('spawn_cron')) {
+            spawn_cron();
+        }
+        
+        // Method 2: Direct HTTP request to wp-cron.php
+        $cron_url = site_url('wp-cron.php');
+        $this->non_blocking_request($cron_url . '?doing_wp_cron=1');
+    }
+
+    /**
+     * Make a non-blocking HTTP request.
+     */
+    private function non_blocking_request($url) {
+        $args = array(
+            'timeout'   => 5,
+            'blocking'  => false,
+            'sslverify' => apply_filters('https_local_ssl_verify', false),
+            'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url(),
+            'redirection' => 0
+        );
+        
+        wp_remote_get($url, $args);
     }
 }

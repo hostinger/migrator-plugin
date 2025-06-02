@@ -266,7 +266,7 @@ class Custom_Migrator_Admin {
             $wp_content_dir . '/vivid-migration-backups',
             $wp_content_dir . '/migration-backups',
             
-            // Plugin-specific exclusions
+            // Plugin exclusions
             $wp_content_dir . '/plugins/custom-migrator',
             $wp_content_dir . '/plugins/all-in-one-migration',
             $wp_content_dir . '/plugins/updraftplus',
