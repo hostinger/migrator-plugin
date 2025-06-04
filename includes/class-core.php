@@ -28,6 +28,13 @@ class Custom_Migrator_Core {
     private $filesystem;
 
     /**
+     * The admin handler.
+     *
+     * @var Custom_Migrator_Admin
+     */
+    private $admin;
+
+    /**
      * Initialize the plugin.
      *
      * @return void
@@ -57,6 +64,7 @@ class Custom_Migrator_Core {
         
         // Initialize the filesystem class for use throughout the plugin
         $this->filesystem = new Custom_Migrator_Filesystem();
+        $this->admin = new Custom_Migrator_Admin();
     }
 
     /**
@@ -73,6 +81,9 @@ class Custom_Migrator_Core {
         // Add settings link to plugins page
         add_filter( 'plugin_action_links_' . plugin_basename( CUSTOM_MIGRATOR_PLUGIN_DIR . 'custom-migrator.php' ), 
                   array( $this, 'add_settings_link' ) );
+        
+        // Add custom cron schedules
+        add_filter('cron_schedules', array($this, 'add_custom_cron_schedules'));
     }
 
     /**
@@ -104,14 +115,15 @@ class Custom_Migrator_Core {
         add_action( 'cm_run_export_direct', array( $this, 'run_export_directly' ) );
         add_action( 'cm_process_export_step_fallback', array( $this, 'process_export_step_fallback' ) );
         
-        // Schedule monitoring if not already scheduled
+        // Enhanced monitoring: Schedule frequent checks (every 1 minute for faster detection)
         if (!wp_next_scheduled('cm_monitor_export')) {
-            wp_schedule_event(time(), 'hourly', 'cm_monitor_export');
+            wp_schedule_event(time(), 'custom_migrator_1min', 'cm_monitor_export');
         }
     }
 
     /**
      * Monitor export progress and detect stuck processes.
+     * Enhanced to detect failed resume attempts on paused exports.
      *
      * @return void
      */
@@ -125,16 +137,37 @@ class Custom_Migrator_Core {
         $status = trim(file_get_contents($status_file));
         $modified_time = filemtime($status_file);
         $current_time = time();
+        $time_diff = $current_time - $modified_time;
         
         // Check for stuck exports with optimized timeouts
         $stuck_statuses = ['starting', 'exporting', 'resuming'];
-        $time_diff = $current_time - $modified_time;
-        
         if (in_array($status, $stuck_statuses) && $time_diff > 120) { // 2 minutes timeout
             $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds. Attempting recovery.");
             
             // Try to restart the export
             $this->force_export_restart();
+            return;
+        }
+        
+        // ENHANCED: Check for failed resume on paused exports
+        if ($status === 'paused') {
+            $resume_info_file = $this->filesystem->get_export_dir() . '/export-resume-info.json';
+            
+            if (file_exists($resume_info_file)) {
+                $resume_data = json_decode(file_get_contents($resume_info_file), true);
+                $last_update = isset($resume_data['last_update']) ? $resume_data['last_update'] : $modified_time;
+                $pause_age = $current_time - $last_update;
+                
+                // If paused for more than 30 seconds without resume, force resume (reduced from 60s)
+                if ($pause_age > 30) {
+                    $files_processed = isset($resume_data['files_processed']) ? $resume_data['files_processed'] : 0;
+                    $this->filesystem->log("Paused export detected ($files_processed files processed, {$pause_age}s since last update). Forcing resume.");
+                    
+                    // Enhanced resume: Multiple attempts with different methods
+                    $this->force_resume_paused_export();
+                    return;
+                }
+            }
         }
         
         // Clean up old monitoring if export is done
@@ -1574,5 +1607,60 @@ class Custom_Migrator_Core {
                 'time_since_update' => $time_diff
             ));
         }
+    }
+
+    /**
+     * Force resume a paused export with multiple fallback methods.
+     *
+     * @return void
+     */
+    private function force_resume_paused_export() {
+        // Method 1: Multiple HTTP requests (more aggressive)
+        $ajax_url = admin_url('admin-ajax.php');
+        $request_params = array(
+            'action' => 'cm_run_export_now',
+            'background_mode' => '1'
+        );
+        
+        for ($i = 0; $i < 3; $i++) {
+            wp_remote_post($ajax_url, array(
+                'method'    => 'POST',
+                'timeout'   => 0.01,
+                'blocking'  => false,
+                'sslverify' => false,
+                'headers'   => array('Connection' => 'close'),
+                'body'      => $request_params,
+            ));
+        }
+        
+        // Method 2: Staggered cron scheduling (multiple attempts)
+        wp_schedule_single_event(time() + 5, 'cm_run_export');   // 5 seconds
+        wp_schedule_single_event(time() + 15, 'cm_run_export');  // 15 seconds  
+        wp_schedule_single_event(time() + 30, 'cm_run_export');  // 30 seconds
+        wp_schedule_single_event(time() + 60, 'cm_run_export');  // 1 minute
+        wp_schedule_single_event(time() + 120, 'cm_run_export'); // 2 minutes
+        
+        // Method 3: Enhanced cron triggering
+        $this->trigger_cron_execution();
+        
+        $this->filesystem->log('Forced resume for paused export with multiple fallback methods');
+    }
+
+    /**
+     * Add custom cron schedules.
+     *
+     * @param array $schedules Existing cron schedules.
+     * @return array Modified cron schedules.
+     */
+    public function add_custom_cron_schedules($schedules) {
+        $schedules['custom_migrator_1min'] = array(
+            'interval' => 1 * 60, // 1 minute
+            'display' => __('Every 1 minute', 'custom-migrator')
+        );
+        $schedules['custom_migrator_5min'] = array(
+            'interval' => 5 * 60, // 5 minutes (kept for compatibility)
+            'display' => __('Every 5 minutes', 'custom-migrator')
+        );
+        return $schedules;
     }
 }
