@@ -115,6 +115,10 @@ class Custom_Migrator_Metadata {
                 'total_size_mb'=> $this->get_database_size(),
                 'total_size_bytes' => $this->get_database_size(true),
                 'total_size_formatted' => $this->filesystem->format_file_size($this->get_database_size(true)),
+                'wp_charset'   => get_option('blog_charset', 'UTF-8'),
+                'server_charset' => $this->get_server_charset(),
+                'server_collation' => $this->get_server_collation(),
+                'mysql_version' => $this->get_mysql_version(),
             ),
             'system' => array(
                 'max_execution_time' => ini_get( 'max_execution_time' ),
@@ -163,5 +167,37 @@ class Custom_Migrator_Metadata {
             $size_mb = $size ? round($size / 1024 / 1024, 2) : 0;
             return $size_mb;
         }
+    }
+
+    /**
+     * Get server character set.
+     *
+     * @return string Server character set.
+     */
+    private function get_server_charset() {
+        global $wpdb;
+        $charset = $wpdb->get_var("SELECT @@character_set_server");
+        return $charset ? $charset : 'unknown';
+    }
+
+    /**
+     * Get server collation.
+     *
+     * @return string Server collation.
+     */
+    private function get_server_collation() {
+        global $wpdb;
+        $collation = $wpdb->get_var("SELECT @@collation_server");
+        return $collation ? $collation : 'unknown';
+    }
+
+    /**
+     * Get MySQL version.
+     *
+     * @return string MySQL version.
+     */
+    private function get_mysql_version() {
+        global $wpdb;
+        return $wpdb->db_version();
     }
 }
