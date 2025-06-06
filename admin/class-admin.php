@@ -120,7 +120,7 @@ class Custom_Migrator_Admin {
      * Add plugin admin menu.
      */
     public function add_admin_menu() {
-        add_menu_page(
+        $hook = add_menu_page(
             'Hostinger Migrator',
             'Hostinger Migrator',
             'manage_options',
@@ -129,6 +129,30 @@ class Custom_Migrator_Admin {
             'dashicons-migrate',
             100
         );
+        
+        // Filter admin notices on our plugin page
+        add_action( "load-{$hook}", array( $this, 'filter_admin_notices' ) );
+    }
+    
+    /**
+     * Filter admin notices to show only migration-related notices on our admin page.
+     */
+    public function filter_admin_notices() {
+        // Remove all admin notices and errors
+        remove_all_actions( 'admin_notices' );
+        remove_all_actions( 'all_admin_notices' );
+        remove_all_actions( 'network_admin_notices' );
+        
+        // Add back only essential WordPress notices
+        add_action( 'admin_notices', array( $this, 'show_migration_notices' ) );
+    }
+    
+    /**
+     * Show only migration-related admin notices.
+     */
+    public function show_migration_notices() {
+        // This will be handled in the admin template
+        // Only migration-specific notices will be shown there
     }
 
     /**

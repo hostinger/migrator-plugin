@@ -284,35 +284,35 @@ class Custom_Migrator_Database {
         
         try {
             // Get row count with timeout check
-            $count_result = $mysqli->query("SELECT COUNT(*) FROM `$table`");
+        $count_result = $mysqli->query("SELECT COUNT(*) FROM `$table`");
             if (!$count_result) {
                 $this->filesystem->log("Error getting row count for table `$table`: " . $mysqli->error);
                 return;
             }
             
-            $count_row = $count_result->fetch_array();
-            $total_rows = $count_row[0];
-            $count_result->free();
-            
-            if ($total_rows === 0) {
-                return;
-            }
+        $count_row = $count_result->fetch_array();
+        $total_rows = $count_row[0];
+        $count_result->free();
+        
+        if ($total_rows === 0) {
+            return;
+        }
             
             $this->filesystem->log("Exporting table `$table` with $total_rows rows");
-            
-            // Get column information
-            $columns_result = $mysqli->query("SHOW COLUMNS FROM `$table`");
+        
+        // Get column information
+        $columns_result = $mysqli->query("SHOW COLUMNS FROM `$table`");
             if (!$columns_result) {
                 $this->filesystem->log("Error getting columns for table `$table`: " . $mysqli->error);
                 return;
             }
             
-            $columns = [];
-            while ($column = $columns_result->fetch_assoc()) {
-                $columns[] = $column;
-            }
-            $columns_result->free();
-            
+        $columns = [];
+        while ($column = $columns_result->fetch_assoc()) {
+            $columns[] = $column;
+        }
+        $columns_result->free();
+        
             // Get primary keys for optimized queries (like All-in-One WP Migration)
             $primary_keys = [];
             $keys_result = $mysqli->query("SHOW KEYS FROM `$table` WHERE Key_name = 'PRIMARY'");
@@ -334,8 +334,8 @@ class Custom_Migrator_Database {
                 if ((time() - $start_time) > $max_execution_time) {
                     $this->filesystem->log("Timeout reached for table `$table` after exporting $exported_rows/$total_rows rows");
                     break;
-                }
-                
+            }
+            
                 // Build optimized query like All-in-One WP Migration
                 if (!empty($primary_keys)) {
                     $table_keys = implode(', ', array_map(function($key) { return "`$key`"; }, $primary_keys));
@@ -373,29 +373,29 @@ class Custom_Migrator_Database {
                     // Start transaction (like All-in-One WP Migration)
                     if ($exported_rows % $transaction_size === 0) {
                         fwrite($sql_fp, "START TRANSACTION;\n");
-                    }
+                }
+                
+                $values = [];
+                
+                foreach ($columns as $column) {
+                    $column_name = $column['Field'];
+                    $column_type = $column['Type'];
+                    $value = $row[$column_name];
                     
-                    $values = [];
-                    
-                    foreach ($columns as $column) {
-                        $column_name = $column['Field'];
-                        $column_type = $column['Type'];
-                        $value = $row[$column_name];
-                        
-                        if (is_null($value)) {
-                            $values[] = "NULL";
-                        } elseif (strpos($column_type, 'int') === 0 || 
-                                strpos($column_type, 'float') === 0 || 
-                                strpos($column_type, 'double') === 0 || 
-                                strpos($column_type, 'decimal') === 0) {
-                            $values[] = $value;
-                        } else {
+                    if (is_null($value)) {
+                        $values[] = "NULL";
+                    } elseif (strpos($column_type, 'int') === 0 || 
+                            strpos($column_type, 'float') === 0 || 
+                            strpos($column_type, 'double') === 0 || 
+                            strpos($column_type, 'decimal') === 0) {
+                        $values[] = $value;
+                    } else {
                             // Handle text fields with better escaping
                             $escaped_value = $mysqli->real_escape_string($value);
                             $values[] = "'" . $escaped_value . "'";
-                        }
                     }
-                    
+                }
+                
                     // Write individual INSERT statement (All-in-One WP Migration style)
                     // This NEVER has semicolon issues because each statement is complete
                     $table_values = implode(',', $values);
@@ -418,8 +418,8 @@ class Custom_Migrator_Database {
                 if ($total_rows > 1000 && ($offset % ($batch_size * 4)) === 0) {
                     $percent = round(($exported_rows / $total_rows) * 100, 1);
                     $this->filesystem->log("Table `$table`: $exported_rows/$total_rows rows ($percent%)");
-                }
-                
+            }
+            
                 // Small pause to prevent overwhelming the database
                 if ($batch_rows > 0) {
                     usleep(10000); // 0.01 second pause
