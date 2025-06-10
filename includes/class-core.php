@@ -1484,15 +1484,16 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Enhanced stuck detection for all processing statuses
+        // Ultra-aggressive stuck detection for shared hosting compatibility
         $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
         if (in_array($status, $processing_statuses)) {
-            // Optimized timeouts for 10-second processing windows
-            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
+            // Ultra-conservative timeouts for shared hosting
+            if ($time_diff > 45) { // 45 seconds timeout (down from 60s)
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
-                // Try to restart if really stuck
-                if ($time_diff > 120) { 
+                // Force restart much sooner for shared hosting
+                if ($time_diff > 60) { // 60 seconds (down from 120s)
+                    $this->filesystem->log("Forcing export restart due to stuck process");
                     $this->force_export_restart();
                 }
                 

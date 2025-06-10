@@ -222,14 +222,23 @@ class Custom_Migrator_Exporter {
         $content_list_file = $export_dir . '/content-list.csv';
         $resume_info_file = $export_dir . '/export-resume-info.json';
         
-        // Load resume data with CSV offset tracking
+        // Load resume data with line-based CSV tracking (FIXED: no more byte-based seeking!)
         $resume_data = $this->load_resume_data($resume_info_file);
-        $csv_offset = $resume_data['csv_offset'] ?? 0;
         $archive_offset = $resume_data['archive_offset'] ?? 0;
         $files_processed = $resume_data['files_processed'] ?? 0;
         $bytes_processed = $resume_data['bytes_processed'] ?? 0;
         
-        $is_resuming = $csv_offset > 0 || $archive_offset > 0;
+        $is_resuming = $files_processed > 0;
+        
+        // Calculate adaptive timeout based on restart patterns
+        $timeout_info = $this->calculate_adaptive_timeout($resume_data);
+        $adaptive_timeout = $timeout_info['timeout'];
+        $cron_mode = $timeout_info['cron_mode'];
+        
+        // Log startup mode
+        if ($is_resuming) {
+            $this->filesystem->log("Resuming in {$timeout_info['mode_name']} - processed $files_processed files so far");
+        }
         
         // Step 1: Enumerate files into CSV for efficient processing
         if (!$is_resuming && !file_exists($content_list_file)) {
@@ -246,9 +255,17 @@ class Custom_Migrator_Exporter {
             throw new Exception('Cannot open content list file');
         }
         
-        // Seek to CSV offset if resuming
-        if ($csv_offset > 0) {
-            fseek($csv_handle, $csv_offset);
+        // Skip already processed files by counting all valid CSV entries (FIXED: consistent logic!)
+        $files_skipped = 0;
+        if ($files_processed > 0) {
+            $this->filesystem->log("🔄 Resuming: skipping $files_processed already processed files");
+            while (($file_data = fgetcsv($csv_handle)) !== FALSE && $files_skipped < $files_processed) {
+                // Parse file data to check if it's valid CSV entry (same logic as processing)
+                if (count($file_data) >= 4) {
+                    $files_skipped++; // Count all valid CSV entries, regardless of current file state
+                }
+            }
+            $this->filesystem->log("✅ Skipped $files_skipped processed files, resuming from next file");
         }
         
         // Open archive file
@@ -267,6 +284,9 @@ class Custom_Migrator_Exporter {
         // Start precise timing for optimal resource management
         $start = microtime(true);
         $completed = true;
+        
+        // Track files processed in this batch for accurate rate calculation
+        $files_processed_this_batch = 0;
         
         try {
             // Process files from CSV one at a time for hosting-friendly resource usage
@@ -296,41 +316,82 @@ class Custom_Migrator_Exporter {
                 
                 if ($result['success']) {
                     $files_processed++;
+                    $files_processed_this_batch++;
                     $bytes_processed += $result['bytes'];
                     
                     // Progress logging every 1000 files
                     if ($files_processed % 1000 === 0) {
                         $elapsed = microtime(true) - $start;
-                        $rate = $files_processed / max($elapsed, 1);
+                        $batch_rate = $files_processed_this_batch / max($elapsed, 1);
+                        $mode_desc = $cron_mode ? "Cron" : "HTTP";
                         $this->filesystem->log(sprintf(
-                            "Single-file processing: %d files (%.2f MB). Rate: %.2f files/sec",
+                            "Processing: %d files (%.2f MB). Batch Rate: %.2f files/sec (%d files in %.1fs) [%s Mode - %ds timeout]",
                             $files_processed,
                             $bytes_processed / (1024 * 1024),
-                            $rate
+                            $batch_rate,
+                            $files_processed_this_batch,
+                            $elapsed,
+                            $mode_desc,
+                            $adaptive_timeout
                         ));
+                    }
+                    
+                    // LVE THROTTLING DETECTION: Check every 100 files for performance degradation
+                    if ($files_processed % 100 === 0) {
+                        static $last_lve_check = null;
+                        static $last_lve_files = 0;
+                        
+                        if ($last_lve_check !== null) {
+                            $time_since_check = microtime(true) - $last_lve_check;
+                            $files_since_check = $files_processed - $last_lve_files;
+                            $recent_rate = $files_since_check / max($time_since_check, 1);
+                            
+                            // If processing rate drops below 5 files/sec, likely LVE throttling
+                            if ($recent_rate < 5 && $files_since_check >= 100) {
+                                $this->filesystem->log(sprintf(
+                                    "⚠️ LVE THROTTLING DETECTED: Rate=%.1f files/sec (last 100 files took %.1fs) - will pause early to avoid limits",
+                                    $recent_rate,
+                                    $time_since_check
+                                ));
+                                
+                                // Force early timeout to avoid hitting harder LVE limits
+                                $completed = false;
+                                break;
+                            }
+                        }
+                        
+                        $last_lve_check = microtime(true);
+                        $last_lve_files = $files_processed;
                     }
                 }
                 
-                // Check timeout immediately after each file for hosting compatibility
-                if (($timeout = apply_filters('ai1wm_completed_timeout', 10))) {
-                    if ((microtime(true) - $start) > $timeout) {
-                        $this->filesystem->log("Pausing after processing $files_processed files (optimal timing)");
-                        
-                        // Save CSV and archive positions for precise resume
-                        $current_csv_offset = ftell($csv_handle);
-                        $current_archive_offset = ftell($archive_handle);
-                        
-                        $this->save_resume_data($resume_info_file, [
-                            'csv_offset' => $current_csv_offset,
-                            'archive_offset' => $current_archive_offset,
-                            'files_processed' => $files_processed,
-                            'bytes_processed' => $bytes_processed,
-                            'last_update' => time()
-                        ]);
-                        
-                        $completed = false;
-                        break; // Pause immediately for hosting compatibility
-                    }
+                // Check adaptive timeout after each file
+                if ((microtime(true) - $start) > $adaptive_timeout) {
+                    $elapsed = microtime(true) - $start;
+                    
+                    $this->filesystem->log(sprintf(
+                        "⏰ Batch complete: Processed %d files in %.1fs using %s (timeout=%ds)",
+                        $files_processed_this_batch,
+                        $elapsed,
+                        $timeout_info['mode_name'],
+                        $adaptive_timeout
+                    ));
+                    
+                    // Save archive positions and file count for precise resume
+                    $current_archive_offset = ftell($archive_handle);
+                    
+                    $this->save_resume_data($resume_info_file, [
+                        'archive_offset' => $current_archive_offset,
+                        'files_processed' => $files_processed,
+                        'bytes_processed' => $bytes_processed,
+                        'last_update' => time(),
+                        'last_restart_time' => time(),
+                        'restart_count' => ($resume_data['restart_count'] ?? 0) + 1,
+                        'cron_mode' => $cron_mode
+                    ]);
+                    
+                    $completed = false;
+                    break; // Pause for optimal batch processing
                 }
             }
             
@@ -347,6 +408,7 @@ class Custom_Migrator_Exporter {
         if (!$completed) {
             $this->filesystem->write_status('paused');
             $this->schedule_immediate_resume();
+            $this->filesystem->log("Scheduled single restart in 2 seconds with HTTP fallback - process will restart");
         } else {
             // Clean up files when completed
             if (file_exists($content_list_file)) {
@@ -358,10 +420,11 @@ class Custom_Migrator_Exporter {
             
             $total_time = microtime(true) - $start;
             $this->filesystem->log(sprintf(
-                "Single-file processing completed: %d files (%.2f MB) in %.2f seconds",
+                "Export completed: %d files (%.2f MB) in %.2f seconds (final batch: %d files)",
                 $files_processed,
                 $bytes_processed / (1024 * 1024),
-                $total_time
+                $total_time,
+                $files_processed_this_batch
             ));
         }
         
@@ -555,25 +618,24 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Load resume data with CSV offset tracking.
+     * Load resume data with file-count tracking (FIXED: count actual processed files!).
      */
     private function load_resume_data($resume_info_file) {
+        $defaults = [
+            'archive_offset' => 0,
+            'files_processed' => 0,
+            'bytes_processed' => 0,
+            'last_restart_time' => time(),
+            'restart_count' => 0,
+            'cron_mode' => false
+        ];
+        
         if (!file_exists($resume_info_file)) {
-            return [
-                'csv_offset' => 0,
-                'archive_offset' => 0,
-                'files_processed' => 0,
-                'bytes_processed' => 0
-            ];
+            return $defaults;
         }
         
         $data = json_decode(file_get_contents($resume_info_file), true);
-        return $data ?: [
-            'csv_offset' => 0,
-            'archive_offset' => 0,
-            'files_processed' => 0,
-            'bytes_processed' => 0
-        ];
+        return $data ? array_merge($defaults, $data) : $defaults;
     }
 
     /**
@@ -581,6 +643,69 @@ class Custom_Migrator_Exporter {
      */
     private function save_resume_data($resume_info_file, $data) {
         file_put_contents($resume_info_file, json_encode($data));
+    }
+
+    /**
+     * Calculate adaptive timeout based on restart patterns for optimal batch sizes.
+     */
+    private function calculate_adaptive_timeout($resume_data) {
+        $current_time = time();
+        $last_restart = $resume_data['last_restart_time'] ?? $current_time;
+        $restart_count = $resume_data['restart_count'] ?? 0;
+        
+        // Calculate time since last restart
+        $restart_gap = $current_time - $last_restart;
+        
+        // Detect cron mode: if restart took >30 seconds, we're likely in cron fallback
+        $is_cron_mode = $restart_gap > 30 || $resume_data['cron_mode'];
+        
+        if ($is_cron_mode) {
+            // ULTRA-CONSERVATIVE mode: Maximum shared hosting compatibility
+            if ($restart_gap > 300) {
+                // Very slow restarts (5+ minutes) = ultra-conservative
+                $timeout = 25; // 2.5x longer than normal (ultra-safe)
+                $mode_name = "Cron Mode (Ultra-Safe Maximum)";
+            } elseif ($restart_gap > 120) {
+                // Slow restarts (2+ minutes) = conservative
+                $timeout = 20; // 2x longer than normal (safe)
+                $mode_name = "Cron Mode (Ultra-Safe High)";
+            } else {
+                // Medium slow restarts (30s-2min) = moderate
+                $timeout = 15; // 1.5x longer than normal (moderate)
+                $mode_name = "Cron Mode (Ultra-Safe Moderate)";
+            }
+        } else {
+            // HTTP mode: stay nimble for fast restarts  
+            $timeout = 10; // Standard timeout
+            $mode_name = "HTTP Mode (Standard)";
+        }
+        
+        // Enhanced logging for batch size detection
+        if ($restart_count > 0) { // Don't log on first run
+            $this->filesystem->log(sprintf(
+                "🔄 Restart #%d detected: Gap=%ds (%.1fm), Mode=%s, Batch-Timeout=%ds",
+                $restart_count,
+                $restart_gap,
+                $restart_gap / 60,
+                $mode_name,
+                $timeout
+            ));
+            
+            if ($is_cron_mode) {
+                $this->filesystem->log(sprintf(
+                    "⚡ Cron mode: %ds gap → Batch size %dx larger (%ds vs 10s standard)",
+                    $restart_gap,
+                    $timeout / 10,
+                    $timeout
+                ));
+            }
+        }
+        
+        return [
+            'timeout' => $timeout,
+            'cron_mode' => $is_cron_mode,
+            'mode_name' => $mode_name
+        ];
     }
 
     /**
