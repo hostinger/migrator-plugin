@@ -9,6 +9,18 @@ jQuery(document).ready(function($) {
     var maxConsecutiveErrors = 5;
     var lastStatusUpdate = null;
     
+    // Status display intervals for the UI elements
+    var exportStatusDisplayInterval = null;
+    var s3StatusDisplayInterval = null;
+    
+    // Start status displays immediately when page loads
+    startExportStatusDisplay();
+    
+    // Only start S3 status monitoring if S3 upload section exists and is visible
+    if ($('.s3-upload-section').length > 0 && $('.s3-upload-section').is(':visible')) {
+        startS3StatusDisplay();
+    }
+    
     // Auto-refresh only if export is in progress
     if ($("#export-progress").length > 0 && $("#export-progress").is(":visible") && 
         $("#export-status-text").text().includes("...") && 
@@ -394,6 +406,14 @@ jQuery(document).ready(function($) {
             clearInterval(s3StatusInterval);
             s3StatusInterval = null;
         }
+        if (exportStatusDisplayInterval) {
+            clearInterval(exportStatusDisplayInterval);
+            exportStatusDisplayInterval = null;
+        }
+        if (s3StatusDisplayInterval) {
+            clearInterval(s3StatusDisplayInterval);
+            s3StatusDisplayInterval = null;
+        }
     });
     
     // Enhanced error handling for AJAX setup with better logging
@@ -434,5 +454,127 @@ jQuery(document).ready(function($) {
     // Start connection monitoring if export is in progress
     if ($("#export-progress").is(":visible")) {
         startConnectionMonitoring();
+    }
+    
+    // Function to start export status display updates
+    function startExportStatusDisplay() {
+        // Clear any existing interval
+        if (exportStatusDisplayInterval) {
+            clearInterval(exportStatusDisplayInterval);
+        }
+        
+        // Check immediately, then every 10 seconds
+        updateExportStatusDisplay();
+        exportStatusDisplayInterval = setInterval(updateExportStatusDisplay, 10000);
+    }
+    
+    // Function to update the export status display
+    function updateExportStatusDisplay() {
+        var timestamp = Date.now();
+        var randomId = Math.floor(Math.random() * 1000000);
+        
+        $.ajax({
+            url: cm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'cm_get_export_status_display',
+                _t: timestamp, // Cache busting timestamp
+                _r: randomId   // Additional random parameter
+            },
+            timeout: 5000,
+            cache: false,
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            },
+            success: function(response) {
+                if (response.success && response.data.status) {
+                    var status = response.data.status;
+                    $('#export-status-content').text(status);
+                    $('#export-status-display').show();
+                    
+                    // Stop checking if export is done or has error
+                    if (status === 'done' || status.indexOf('error:') === 0) {
+                        clearInterval(exportStatusDisplayInterval);
+                        exportStatusDisplayInterval = null;
+                    }
+                } else {
+                    // No status file or empty status
+                    $('#export-status-content').text('-');
+                    $('#export-status-display').hide();
+                }
+            },
+            error: function() {
+                // On error, just hide the display
+                $('#export-status-display').hide();
+            }
+        });
+    }
+    
+    // Function to start S3 status display updates
+    function startS3StatusDisplay() {
+        // Clear any existing interval
+        if (s3StatusDisplayInterval) {
+            clearInterval(s3StatusDisplayInterval);
+        }
+        
+        // Check immediately, then every 10 seconds
+        updateS3StatusDisplay();
+        s3StatusDisplayInterval = setInterval(updateS3StatusDisplay, 10000);
+    }
+    
+    // Function to update the S3 status display
+    function updateS3StatusDisplay() {
+        // Safety check: only proceed if S3 status display element exists
+        if ($('#s3-upload-status-display').length === 0) {
+            // Element doesn't exist, stop monitoring
+            if (s3StatusDisplayInterval) {
+                clearInterval(s3StatusDisplayInterval);
+                s3StatusDisplayInterval = null;
+            }
+            return;
+        }
+        
+        var timestamp = Date.now();
+        var randomId = Math.floor(Math.random() * 1000000);
+        
+        $.ajax({
+            url: cm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'cm_get_s3_status_display',
+                _t: timestamp, // Cache busting timestamp
+                _r: randomId   // Additional random parameter
+            },
+            timeout: 5000,
+            cache: false,
+            headers: {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            },
+            success: function(response) {
+                if (response.success && response.data.status) {
+                    var status = response.data.status;
+                    $('#s3-upload-status-content').text(status);
+                    $('#s3-upload-status-display').show();
+                    
+                    // Stop checking if upload is done or has error
+                    if (status === 'done' || status.indexOf('error:') === 0) {
+                        clearInterval(s3StatusDisplayInterval);
+                        s3StatusDisplayInterval = null;
+                    }
+                } else {
+                    // No status file or empty status
+                    $('#s3-upload-status-content').text('-');
+                    $('#s3-upload-status-display').hide();
+                }
+            },
+            error: function() {
+                // On error, just hide the display
+                $('#s3-upload-status-display').hide();
+            }
+        });
     }
 });
