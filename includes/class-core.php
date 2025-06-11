@@ -101,6 +101,11 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
         add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
         add_action( 'wp_ajax_cm_debug_status', array( $this, 'handle_debug_status' ) );
+        
+        // Status display handlers (no privilege required for UI display)
+        add_action( 'wp_ajax_cm_get_export_status_display', array( $this, 'handle_get_export_status_display' ) );
+        add_action( 'wp_ajax_cm_get_s3_status_display', array( $this, 'handle_get_s3_status_display' ) );
+        
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
     }
 
@@ -1484,16 +1489,15 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Ultra-aggressive stuck detection for shared hosting compatibility
+        // Enhanced stuck detection for all processing statuses
         $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
         if (in_array($status, $processing_statuses)) {
-            // Ultra-conservative timeouts for shared hosting
-            if ($time_diff > 45) { // 45 seconds timeout (down from 60s)
+            // Optimized timeouts for 10-second processing windows
+            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
-                // Force restart much sooner for shared hosting
-                if ($time_diff > 60) { // 60 seconds (down from 120s)
-                    $this->filesystem->log("Forcing export restart due to stuck process");
+                // Try to restart if really stuck
+                if ($time_diff > 120) { 
                     $this->force_export_restart();
                 }
                 
@@ -1663,5 +1667,75 @@ class Custom_Migrator_Core {
             'display' => __('Every 5 minutes', 'custom-migrator')
         );
         return $schedules;
+    }
+
+    /**
+     * Handle AJAX request to get export status for UI display.
+     * No security check needed as this just reads status text file content.
+     *
+     * @return void
+     */
+    public function handle_get_export_status_display() {
+        // Enhanced cache-busting headers
+        header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
+        header('Last-Modified: ' . gmdate('D, d M Y H:i:s') . ' GMT');
+
+        $status_file = $this->filesystem->get_export_dir() . '/export-status.txt';
+        
+        if ( ! file_exists( $status_file ) ) {
+            wp_send_json_success( array( 'status' => '' ) );
+            return;
+        }
+
+        // Clear any file stat cache to ensure fresh data
+        clearstatcache(true, $status_file);
+        
+        // Get file modification time for additional cache-busting
+        $file_mtime = filemtime($status_file);
+        
+        $status = trim( file_get_contents( $status_file ) );
+        
+        wp_send_json_success( array( 
+            'status' => $status,
+            'timestamp' => time(),
+            'file_mtime' => $file_mtime
+        ) );
+    }
+
+    /**
+     * Handle AJAX request to get S3 upload status for UI display.
+     * No security check needed as this just reads status text file content.
+     *
+     * @return void
+     */
+    public function handle_get_s3_status_display() {
+        // Enhanced cache-busting headers
+        header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
+        header('Last-Modified: ' . gmdate('D, d M Y H:i:s') . ' GMT');
+
+        $s3_status_file = $this->filesystem->get_export_dir() . '/s3-upload-status.txt';
+        
+        if ( ! file_exists( $s3_status_file ) ) {
+            wp_send_json_success( array( 'status' => '' ) );
+            return;
+        }
+
+        // Clear any file stat cache to ensure fresh data
+        clearstatcache(true, $s3_status_file);
+        
+        // Get file modification time for additional cache-busting
+        $file_mtime = filemtime($s3_status_file);
+        
+        $status = trim( file_get_contents( $s3_status_file ) );
+        
+        wp_send_json_success( array( 
+            'status' => $status,
+            'timestamp' => time(),
+            'file_mtime' => $file_mtime
+        ) );
     }
 }

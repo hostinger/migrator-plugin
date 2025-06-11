@@ -147,6 +147,11 @@ if ( ! defined( 'WPINC' ) ) {
                 </span>
                 <div id="export-log-preview" style="margin-top: 10px; color: #666; font-style: italic; display: none;"></div>
             </div>
+            
+            <!-- Export Status Display -->
+            <div id="export-status-display" style="margin-top: 15px; padding: 10px; background: #f9f9f9; border-left: 4px solid #0073aa; font-family: monospace; font-size: 12px; color: #333; display: none;">
+                <strong>Export Status:</strong> <span id="export-status-content">-</span>
+            </div>
         </div>
     </div>
     
@@ -232,6 +237,12 @@ if ( ! defined( 'WPINC' ) ) {
                     </tr>
                 </table>
                 <div id="s3-upload-status" style="margin-bottom: 15px; display: none;"></div>
+                
+                <!-- S3 Upload Status Display -->
+                <div id="s3-upload-status-display" style="margin-bottom: 15px; padding: 10px; background: #f9f9f9; border-left: 4px solid #00a32a; font-family: monospace; font-size: 12px; color: #333; display: none;">
+                    <strong>S3 Upload Status:</strong> <span id="s3-upload-status-content">-</span>
+                </div>
+                
                 <p class="submit">
                     <input type="submit" name="upload_to_s3" id="upload-to-s3" class="button button-primary" value="<?php esc_attr_e('Upload to S3', 'custom-migrator'); ?>">
                     <span class="spinner" id="s3-upload-spinner" style="float: none; margin-top: 4px;"></span>
