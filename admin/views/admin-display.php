@@ -251,27 +251,7 @@ if ( ! defined( 'WPINC' ) ) {
         </div>
         <?php endif; ?>
         
-        <div class="server-paths">
-            <h3><?php esc_html_e( 'Server Paths', 'custom-migrator' ); ?></h3>
-            <p><?php esc_html_e( 'Hosting provider information:', 'custom-migrator' ); ?></p>
-            <div class="server-paths-info">
-                <code><?php echo esc_html($export_dir); ?></code>
-            </div>
-        </div>
-        
-        <div class="import-instructions">
-            <h3><?php esc_html_e( 'How to Import', 'custom-migrator' ); ?></h3>
-            <p><?php esc_html_e( 'To import this site on your new server:', 'custom-migrator' ); ?></p>
-            <ol>
-                <li><?php esc_html_e( 'Download all files listed above', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Install WordPress on your new server', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Decompress the .sql.gz file using gunzip or a similar tool', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Import the SQL file using phpMyAdmin or similar database tool', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Extract the content from the .hstgr file to your new wp-content directory', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Update your wp-config.php file with the database credentials', 'custom-migrator' ); ?></li>
-                <li><?php esc_html_e( 'Update site URL in database if your domain has changed', 'custom-migrator' ); ?></li>
-            </ol>
-        </div>
+
     </div>
     
     <div class="custom-migrator-section">
@@ -279,11 +259,15 @@ if ( ! defined( 'WPINC' ) ) {
         <table class="widefat">
             <tr>
                 <th><?php esc_html_e( 'WordPress Version', 'custom-migrator' ); ?></th>
-                <td><?php echo esc_html( get_bloginfo( 'version' ) ); ?></td>
+                <td id="wordpress-version"><?php echo esc_html( get_bloginfo( 'version' ) ); ?></td>
             </tr>
             <tr>
                 <th><?php esc_html_e( 'PHP Version', 'custom-migrator' ); ?></th>
-                <td><?php echo esc_html( phpversion() ); ?></td>
+                <td id="php-version"><?php echo esc_html( phpversion() ); ?></td>
+            </tr>
+            <tr>
+                <th><?php esc_html_e( 'Table Prefix', 'custom-migrator' ); ?></th>
+                <td id="table-prefix"><?php echo esc_html( $table_prefix ); ?></td>
             </tr>
             <tr>
                 <th><?php esc_html_e( 'Max Execution Time', 'custom-migrator' ); ?></th>
@@ -334,13 +318,6 @@ if ( ! defined( 'WPINC' ) ) {
                         <span class="dashicons dashicons-yes" style="color: green;"></span>
                         <?php esc_html_e('Enabled and working', 'custom-migrator'); ?>
                     <?php endif; ?>
-                </td>
-            </tr>
-            <tr>
-                <th><?php esc_html_e( 'Security', 'custom-migrator' ); ?></th>
-                <td>
-                    <span class="dashicons dashicons-shield-alt" style="color: green;"></span>
-                    <?php esc_html_e( 'Secure randomized filenames', 'custom-migrator' ); ?>
                 </td>
             </tr>
         </table>

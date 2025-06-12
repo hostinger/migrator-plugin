@@ -262,6 +262,10 @@ class Custom_Migrator_Admin {
         $memory_limit = ini_get( 'memory_limit' );
         $upload_max_filesize = ini_get( 'upload_max_filesize' );
         
+        // Get database table prefix
+        global $wpdb;
+        $table_prefix = $wpdb->prefix;
+        
         // Get WP content size estimate - using accurate calculation method
         $wp_content_size = $this->get_accurate_wp_content_size();
         $wp_content_size_formatted = $this->filesystem->format_file_size($wp_content_size);
