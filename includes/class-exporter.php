@@ -413,7 +413,7 @@ class Custom_Migrator_Exporter {
             }
 
             // Final consistency check: ensure at least 99% of enumerated files were archived
-            $total_files_enumerated = $this->count_files_in_directory($wp_content_dir);
+            $total_files_enumerated = $this->count_lines_in_csv($content_list_file);
             $completion_rate = $total_files_enumerated > 0 ? ($files_processed / $total_files_enumerated) : 1;
             if ($total_files_enumerated > 0 && $completion_rate < 0.99) {
                 $missing = $total_files_enumerated - $files_processed;
@@ -1035,19 +1035,19 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Count files in a directory.
+     * Count lines in a CSV file (used for enumerated file count).
      */
-    private function count_files_in_directory($directory) {
-        $file_count = 0;
-        $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
-            RecursiveIteratorIterator::LEAVES_ONLY
-        );
-        foreach ($iterator as $file) {
-            if ($file->isFile()) {
-                $file_count++;
+    private function count_lines_in_csv($csv_file) {
+        $count = 0;
+        if (file_exists($csv_file)) {
+            $handle = fopen($csv_file, 'r');
+            if ($handle) {
+                while (fgetcsv($handle) !== false) {
+                    $count++;
+                }
+                fclose($handle);
             }
         }
-        return $file_count;
+        return $count;
     }
 }
