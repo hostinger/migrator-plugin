@@ -411,14 +411,33 @@ class Custom_Migrator_Exporter {
             if (file_exists($resume_info_file)) {
                 @unlink($resume_info_file);
             }
-            
-            $total_time = microtime(true) - $start;
-            $this->filesystem->log(sprintf(
-                "Single-file processing completed: %d files (%.2f MB) in %.2f seconds",
-                $files_processed,
-                $bytes_processed / (1024 * 1024),
-                $total_time
-            ));
+
+            // Final consistency check: ensure at least 99% of enumerated files were archived
+            $total_files_enumerated = $this->count_files_in_directory($wp_content_dir);
+            $completion_rate = $total_files_enumerated > 0 ? ($files_processed / $total_files_enumerated) : 1;
+            if ($total_files_enumerated > 0 && $completion_rate < 0.99) {
+                $missing = $total_files_enumerated - $files_processed;
+                $error_msg = sprintf(
+                    'Export incomplete: Only %d of %d files exported (%.1f%%). Missing %d files.',
+                    $files_processed,
+                    $total_files_enumerated,
+                    $completion_rate * 100,
+                    $missing
+                );
+                $this->filesystem->write_status('error: ' . $error_msg);
+                $this->filesystem->log('❌ EXPORT VALIDATION FAILED: ' . $error_msg);
+                throw new Exception($error_msg);
+            } else {
+                $total_time = microtime(true) - $start;
+                $this->filesystem->log(sprintf(
+                    'Single-file processing completed: %d files (%.2f MB) in %.2f seconds',
+                    $files_processed,
+                    $bytes_processed / (1024 * 1024),
+                    $total_time
+                ));
+                $this->filesystem->write_status('done');
+                $this->filesystem->log('Export completed successfully');
+            }
         }
         
         return $completed ? true : 'paused';
@@ -1013,5 +1032,22 @@ class Custom_Migrator_Exporter {
             $current_status['last_update'] = time();
             file_put_contents($status_file, json_encode($current_status));
         }
+    }
+
+    /**
+     * Count files in a directory.
+     */
+    private function count_files_in_directory($directory) {
+        $file_count = 0;
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+        foreach ($iterator as $file) {
+            if ($file->isFile()) {
+                $file_count++;
+            }
+        }
+        return $file_count;
     }
 }
