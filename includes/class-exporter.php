@@ -224,10 +224,10 @@ class Custom_Migrator_Exporter {
         
         // Load resume data with CSV offset tracking
         $resume_data = $this->load_resume_data($resume_info_file);
-        $csv_offset = $resume_data['csv_offset'] ?? 0;
-        $archive_offset = $resume_data['archive_offset'] ?? 0;
-        $files_processed = $resume_data['files_processed'] ?? 0;
-        $bytes_processed = $resume_data['bytes_processed'] ?? 0;
+        $csv_offset = isset($resume_data['csv_offset']) ? $resume_data['csv_offset'] : 0;
+        $archive_offset = isset($resume_data['archive_offset']) ? $resume_data['archive_offset'] : 0;
+        $files_processed = isset($resume_data['files_processed']) ? $resume_data['files_processed'] : 0;
+        $bytes_processed = isset($resume_data['bytes_processed']) ? $resume_data['bytes_processed'] : 0;
         
         $is_resuming = $csv_offset > 0 || $archive_offset > 0;
         
@@ -381,7 +381,7 @@ class Custom_Migrator_Exporter {
                         'bytes_processed' => $bytes_processed,
                         'last_update' => time(),
                         'last_restart_time' => time(),
-                        'restart_count' => ($resume_data['restart_count'] ?? 0) + 1,
+                        'restart_count' => (isset($resume_data['restart_count']) ? $resume_data['restart_count'] : 0) + 1,
                         'cron_mode' => $cron_mode
                     ]);
                     
@@ -598,8 +598,6 @@ class Custom_Migrator_Exporter {
         return ['success' => true, 'bytes' => $bytes_copied];
     }
 
-
-
     /**
      * Load resume data with CSV offset tracking.
      */
@@ -635,8 +633,8 @@ class Custom_Migrator_Exporter {
      */
     private function calculate_adaptive_timeout($resume_data) {
         $current_time = time();
-        $last_restart = $resume_data['last_restart_time'] ?? $current_time;
-        $restart_count = $resume_data['restart_count'] ?? 0;
+        $last_restart = isset($resume_data['last_restart_time']) ? $resume_data['last_restart_time'] : $current_time;
+        $restart_count = isset($resume_data['restart_count']) ? $resume_data['restart_count'] : 0;
         
         // Calculate time since last restart
         $restart_gap = $current_time - $last_restart;
@@ -957,7 +955,7 @@ class Custom_Migrator_Exporter {
                 // Check if database export is actually running
                 if (file_exists($status_file)) {
                     $status = json_decode(file_get_contents($status_file), true);
-                    $progress_time = $status['last_update'] ?? 0;
+                    $progress_time = isset($status['last_update']) ? $status['last_update'] : 0;
                     
                     // If no progress in last 2 minutes, consider it stuck
                     if (($current_time - $progress_time) > 120) {
