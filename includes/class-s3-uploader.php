@@ -75,7 +75,7 @@ class Custom_Migrator_S3_Uploader {
             
             // Check if file exists
             if (!isset($file_paths[$file_type]) || !file_exists($file_paths[$file_type])) {
-                $this->filesystem->log("File not found for $file_type: " . ($file_paths[$file_type] ?? 'undefined path'));
+                $this->filesystem->log("File not found for $file_type: " . (isset($file_paths[$file_type]) ? $file_paths[$file_type] : 'undefined path'));
                 $results['messages'][] = "File not found for $file_type.";
                 $results['success'] = false;
                 continue;
