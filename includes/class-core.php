@@ -35,6 +35,13 @@ class Custom_Migrator_Core {
     private $admin;
 
     /**
+     * The fallback exporter handler.
+     *
+     * @var Custom_Migrator_Fallback_Exporter
+     */
+    private $fallback_exporter;
+
+    /**
      * Initialize the plugin.
      *
      * @return void
@@ -56,15 +63,19 @@ class Custom_Migrator_Core {
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'admin/class-admin.php';
         
         // Include classes
+        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-helper.php';
+        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-file-enumerator.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-exporter.php';
-        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-database.php';
+        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-database-exporter.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-filesystem.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-metadata.php';
         require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-s3-uploader.php';
+        require_once CUSTOM_MIGRATOR_PLUGIN_DIR . 'includes/class-fallback-exporter.php';
         
         // Initialize the filesystem class for use throughout the plugin
         $this->filesystem = new Custom_Migrator_Filesystem();
         $this->admin = new Custom_Migrator_Admin();
+        $this->fallback_exporter = new Custom_Migrator_Fallback_Exporter();
     }
 
     /**
@@ -78,7 +89,7 @@ class Custom_Migrator_Core {
         add_action( 'admin_enqueue_scripts', array( $admin, 'enqueue_scripts' ) );
         add_action( 'admin_init', array( $admin, 'handle_form_submission' ) );
         
-        // Add settings link to plugins page
+        // Add settings link to the plugins page
         add_filter( 'plugin_action_links_' . plugin_basename( CUSTOM_MIGRATOR_PLUGIN_DIR . 'custom-migrator.php' ), 
                   array( $this, 'add_settings_link' ) );
         
@@ -105,6 +116,13 @@ class Custom_Migrator_Core {
         // Status display handlers (no privilege required for UI display)
         add_action( 'wp_ajax_cm_get_export_status_display', array( $this, 'handle_get_export_status_display' ) );
         add_action( 'wp_ajax_cm_get_s3_status_display', array( $this, 'handle_get_s3_status_display' ) );
+        
+        // FALLBACK AJAX EXPORT SYSTEM - Following All-in-One WP Migration approach
+        // Register both privileged and non-privileged actions for maximum compatibility
+        add_action( 'wp_ajax_cm_fallback_export', array( $this->fallback_exporter, 'handle_fallback_export' ) );
+        add_action( 'wp_ajax_nopriv_cm_fallback_export', array( $this->fallback_exporter, 'handle_fallback_export' ) );
+        add_action( 'wp_ajax_cm_fallback_status', array( $this->fallback_exporter, 'handle_fallback_status' ) );
+        add_action( 'wp_ajax_nopriv_cm_fallback_status', array( $this->fallback_exporter, 'handle_fallback_status' ) );
         
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
     }
@@ -133,6 +151,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     public function monitor_export_progress() {
+        // CRITICAL: Do not interfere with fallback exports
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Monitor: Fallback export detected, skipping monitoring");
+            return;
+        }
+        
         $status_file = $this->filesystem->get_status_file_path();
         
         if (!file_exists($status_file)) {
@@ -140,6 +164,13 @@ class Custom_Migrator_Core {
         }
         
         $status = trim(file_get_contents($status_file));
+        
+        // CRITICAL: Do NOT interfere with fallback exports
+        if (strpos($status, 'fallback_') === 0) {
+            $this->filesystem->log("Monitor: Detected fallback export ($status), skipping regular monitoring");
+            return;
+        }
+        
         $modified_time = filemtime($status_file);
         $current_time = time();
         $time_diff = $current_time - $modified_time;
@@ -187,6 +218,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function force_export_restart() {
+        // CRITICAL: Do not restart during fallback exports
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Monitor: Fallback export active, skipping restart");
+            return;
+        }
+        
         // Clear any existing scheduled events
         wp_clear_scheduled_hook('cm_run_export');
         
@@ -207,6 +244,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function trigger_cron_execution() {
+        // CRITICAL: Do not trigger cron during fallback exports
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Cron: Fallback export active, skipping cron trigger");
+            return;
+        }
+        
         // Method 1: Standard WordPress spawn_cron
         if (function_exists('spawn_cron')) {
             spawn_cron();
@@ -387,6 +430,13 @@ class Custom_Migrator_Core {
             wp_send_json_error( array( 'message' => 'Security check failed' ) );
         }
 
+        // CRITICAL: Immediately clear status file to prevent "done" status from showing
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            @unlink($status_file);
+        }
+        $this->filesystem->write_status('starting');
+
         $base_dir = $this->filesystem->get_export_dir();
         
         // Create export directory if it doesn't exist
@@ -479,6 +529,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function schedule_immediate_background_start() {
+        // CRITICAL: Do not start regular export during fallback
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Background start: Fallback export active, skipping regular export start");
+            return;
+        }
+        
         $ajax_url = admin_url('admin-ajax.php');
         
         $request_params = array(
@@ -507,6 +563,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function schedule_immediate_background_resume() {
+        // CRITICAL: Do not resume regular export during fallback
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Background resume: Fallback export active, skipping regular export resume");
+            return;
+        }
+        
         $ajax_url = admin_url('admin-ajax.php');
         
         $request_params = array(
@@ -667,6 +729,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     private function continue_export($params) {
+        // CRITICAL: Do not continue regular export during fallback
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Continue: Fallback export active, skipping regular export continuation");
+            return;
+        }
+        
         $this->filesystem->log("Starting immediate background continuation for step: " . $params['step']);
         
         // Method 1: Immediate HTTP request to self (most reliable)
@@ -1037,6 +1105,12 @@ class Custom_Migrator_Core {
      * @return void
      */
     public function run_export() {
+        // CRITICAL: Do not run regular export during fallback
+        if ($this->fallback_exporter->is_fallback_export_active()) {
+            $this->filesystem->log("Run export: Fallback export active, skipping regular export");
+            return;
+        }
+        
         // Detect execution environment
         $is_background = $this->is_background_execution();
         $this->filesystem->log('Export execution started (background: ' . ($is_background ? 'yes' : 'no') . ')');
@@ -1263,6 +1337,12 @@ class Custom_Migrator_Core {
         
         // If export is paused, we need to resume via run_export, not step processing
         if ($current_status === 'paused') {
+            // CRITICAL: Do not schedule during fallback exports
+            if ($this->fallback_exporter->is_fallback_export_active()) {
+                $this->filesystem->log('Fallback export active, skipping paused export resume');
+                return;
+            }
+            
             $this->filesystem->log('Export is paused, scheduling resume via run_export instead of step processing');
             wp_schedule_single_event(time() + 2, 'cm_run_export');
             $this->trigger_cron_execution();
@@ -1738,4 +1818,6 @@ class Custom_Migrator_Core {
             'file_mtime' => $file_mtime
         ) );
     }
+
+
 }

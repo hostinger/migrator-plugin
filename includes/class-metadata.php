@@ -27,9 +27,10 @@ class Custom_Migrator_Metadata {
     /**
      * Generate metadata for the export.
      *
+     * @param array $options Optional configuration for metadata generation.
      * @return array The export metadata.
      */
-    public function generate() {
+    public function generate($options = array()) {
         global $wp_version, $wpdb;
 
         // Get active theme data
@@ -130,7 +131,86 @@ class Custom_Migrator_Metadata {
             ),
         );
 
+        // Apply any provided options to override defaults
+        if (!empty($options)) {
+            $metadata = $this->apply_metadata_options($metadata, $options);
+        }
+
         return $metadata;
+    }
+
+    /**
+     * Apply configuration options to metadata.
+     *
+     * @param array $metadata Base metadata.
+     * @param array $options Configuration options.
+     * @return array Modified metadata.
+     */
+    private function apply_metadata_options($metadata, $options) {
+        // Add export-specific information if provided
+        if (isset($options['file_format'])) {
+            $metadata['export_info']['file_format'] = $options['file_format'];
+        }
+        
+        if (isset($options['exporter_version'])) {
+            $metadata['export_info']['exporter_version'] = $options['exporter_version'];
+        }
+        
+        if (isset($options['export_type'])) {
+            $metadata['export_info']['export_type'] = $options['export_type'];
+        }
+        
+        if (isset($options['export_method'])) {
+            $metadata['export_info']['export_method'] = $options['export_method'];
+        }
+
+        // Add custom metadata fields if provided
+        if (isset($options['custom_fields']) && is_array($options['custom_fields'])) {
+            foreach ($options['custom_fields'] as $key => $value) {
+                $metadata['export_info'][$key] = $value;
+            }
+        }
+
+        return $metadata;
+    }
+
+    /**
+     * Generate and save metadata to file with unified approach.
+     *
+     * @param string $file_path Path where to save the metadata file.
+     * @param array  $options   Optional configuration for metadata generation.
+     * @return bool Success status.
+     */
+    public function generate_and_save($file_path, $options = array()) {
+        try {
+            $this->filesystem->log('Generating metadata file: ' . basename($file_path));
+            
+            // Check if metadata file already exists and skip if requested
+            if (file_exists($file_path) && isset($options['skip_if_exists']) && $options['skip_if_exists']) {
+                $this->filesystem->log('Metadata file already exists, skipping generation');
+                return true;
+            }
+            
+            // Generate metadata with options
+            $metadata = $this->generate($options);
+            
+            // Save to file with pretty formatting
+            $json_content = wp_json_encode($metadata, JSON_PRETTY_PRINT);
+            $result = file_put_contents($file_path, $json_content);
+            
+            if ($result === false) {
+                throw new Exception('Failed to write metadata file');
+            }
+            
+            $file_size = $this->filesystem->format_file_size(filesize($file_path));
+            $this->filesystem->log("Metadata file generated successfully: {$file_size}");
+            
+            return true;
+            
+        } catch (Exception $e) {
+            $this->filesystem->log('Metadata generation failed: ' . $e->getMessage());
+            return false;
+        }
     }
 
     /**
