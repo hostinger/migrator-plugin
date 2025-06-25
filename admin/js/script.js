@@ -1,6 +1,235 @@
 /**
  * Admin JavaScript for Custom Migrator plugin with enhanced error handling and monitoring
  */
+
+// FALLBACK EXPORT SYSTEM - Global variables and functions (must be outside document.ready)
+var fallbackExportState = {
+    running: false,
+    currentStep: null,
+    params: {},
+    attempts: 0,
+    maxAttempts: 5  // Increased from 3 to 5 for better reliability
+};
+
+// Global function for fallback export (called from onclick)
+window.startFallbackExport = function() {
+    // CRITICAL: Prevent multiple button presses
+    if (window.fallbackExportStarted) {
+        console.log('Fallback export already started, ignoring duplicate button press');
+        return false;
+    }
+    
+    // CRITICAL: Set flag immediately to prevent duplicate calls
+    window.fallbackExportStarted = true;
+    
+    // Check if jQuery is available
+    if (typeof jQuery === 'undefined') {
+        alert('Error: jQuery is not loaded. Please refresh the page.');
+        window.fallbackExportStarted = false; // Reset flag on error
+        return false;
+    }
+    
+    var $ = jQuery;
+    
+    // Check if cm_ajax is available
+    if (typeof cm_ajax === 'undefined') {
+        alert('Error: AJAX configuration not found. Please refresh the page.');
+        window.fallbackExportStarted = false; // Reset flag on error
+        return false;
+    }
+    
+    // CRITICAL: Disable both buttons IMMEDIATELY
+    $("#start-export, #start-fallback-export").prop('disabled', true).addClass('button-disabled');
+    
+    // Hide main progress, show fallback progress
+    $("#export-progress").hide();
+    $("#fallback-progress").show();
+    $("#fallback-status-text").text("Initializing fallback export...");
+    $("#fallback-step-info").text("");
+    
+    // Generate unique session ID for this export
+    var sessionId = 'fallback_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    
+    // Reset fallback state
+    fallbackExportState = {
+        running: true,
+        currentStep: 'init',
+        params: { session_id: sessionId },
+        attempts: 0,
+        maxAttempts: 5,  // Increased from 3 to 5 for better reliability
+        activeAjaxCall: null,  // Track active AJAX call
+        sessionId: sessionId   // Store session ID
+    };
+    
+    console.log('Starting fallback export with session ID:', sessionId);
+    
+    // Start the fallback export process
+    processFallbackStep('init', { session_id: sessionId });
+    return false;
+};
+
+// Process a single step of the fallback export
+function processFallbackStep(step, params) {
+    if (!fallbackExportState.running) {
+        return; // Export was cancelled
+    }
+    
+    // CRITICAL: Prevent multiple simultaneous AJAX calls
+    if (fallbackExportState.activeAjaxCall) {
+        console.log('AJAX call already active, aborting duplicate call for step:', step);
+        return;
+    }
+    
+    var $ = jQuery;
+    
+    fallbackExportState.currentStep = step;
+    fallbackExportState.attempts++;
+    
+    console.log('Processing fallback step:', step, 'Attempt:', fallbackExportState.attempts);
+    
+    fallbackExportState.activeAjaxCall = $.ajax({
+        url: cm_ajax.ajax_url,
+        type: 'POST',
+        data: {
+            action: 'cm_fallback_export',
+            step: step,
+            params: params
+        },
+        timeout: 60000, // 60 second timeout per step
+        success: function(response) {
+            // Clear active AJAX call flag
+            fallbackExportState.activeAjaxCall = null;
+            
+            if (response.success) {
+                var result = response.data;
+                
+                // Update UI with current step progress
+                $("#fallback-status-text").text(result.message || "Processing...");
+                
+                if (result.file_count) {
+                    $("#fallback-step-info").text("Files found: " + result.file_count);
+                } else if (result.files_processed) {
+                    $("#fallback-step-info").text("Files processed: " + result.files_processed);
+                }
+                
+                // Reset attempt counter on success
+                fallbackExportState.attempts = 0;
+                fallbackExportState.params = result.params || {};
+                
+                // Ensure session_id is always preserved
+                if (fallbackExportState.sessionId) {
+                    fallbackExportState.params.session_id = fallbackExportState.sessionId;
+                }
+                
+                // Check for error response
+                if (result.error) {
+                    fallbackExportError("Export failed: " + result.message);
+                    return;
+                }
+                
+                if (result.completed && result.next_step) {
+                    // Continue to next step
+                    setTimeout(function() {
+                        processFallbackStep(result.next_step, fallbackExportState.params);
+                    }, 500); // Small delay between steps
+                    
+                } else if (result.completed && result.final) {
+                    // Export completed successfully
+                    fallbackExportComplete();
+                    
+                } else if (!result.completed && result.next_step) {
+                    // Same step needs to continue (like file archiving)
+                    var delay = result.pause_requested ? 5000 : 500; // 5 seconds if pause requested, otherwise 500ms
+                    setTimeout(function() {
+                        processFallbackStep(result.next_step, fallbackExportState.params);
+                    }, delay);
+                }
+                
+            } else {
+                // Handle error
+                var errorMsg = response.data ? response.data.message : "Export step failed";
+                fallbackExportError("Step '" + step + "' failed: " + errorMsg);
+            }
+        },
+        error: function(xhr, status, error) {
+            // Clear active AJAX call flag
+            fallbackExportState.activeAjaxCall = null;
+            
+            console.log('Fallback step error:', {step: step, status: status, error: error, xhr: xhr});
+            
+            if (fallbackExportState.attempts < fallbackExportState.maxAttempts) {
+                // Retry the same step - ensure session_id is preserved
+                if (fallbackExportState.sessionId && (!params.session_id || params.session_id !== fallbackExportState.sessionId)) {
+                    params.session_id = fallbackExportState.sessionId;
+                }
+                
+                $("#fallback-step-info").text("Retrying step... (attempt " + (fallbackExportState.attempts + 1) + "/" + fallbackExportState.maxAttempts + ")");
+                setTimeout(function() {
+                    processFallbackStep(step, params);
+                }, 2000); // 2 second delay before retry
+            } else {
+                // Max attempts reached
+                var errorMsg = status === 'timeout' ? 
+                    "Step timed out after multiple attempts" : 
+                    "Network error after multiple attempts";
+                fallbackExportError("Step '" + step + "' failed: " + errorMsg);
+            }
+        }
+    });
+}
+
+// Handle fallback export completion
+function fallbackExportComplete() {
+    var $ = jQuery;
+    fallbackExportState.running = false;
+    
+    // Reset global flags
+    window.fallbackExportStarted = false;
+    
+    $("#fallback-status-text").html('<span style="color: green;"><span class="dashicons dashicons-yes"></span> Fallback export completed successfully!</span>');
+    $("#fallback-step-info").text("All files have been exported and are ready for download.");
+    
+    // Hide spinner
+    $("#fallback-progress .spinner").removeClass("is-active");
+    
+    // Re-enable buttons and restore text
+    $("#start-export, #start-fallback-export").prop('disabled', false).removeClass('button-disabled');
+    $("#start-fallback-export").html('<?php esc_html_e("Start Export - Fallback", "custom-migrator"); ?>');
+    
+    // Refresh the page to show download links
+    setTimeout(function() {
+        window.location.reload();
+    }, 3000);
+}
+
+// Handle fallback export error
+function fallbackExportError(message) {
+    var $ = jQuery;
+    fallbackExportState.running = false;
+    
+    // Reset global flags
+    window.fallbackExportStarted = false;
+    
+    $("#fallback-status-text").html('<span style="color: red;"><span class="dashicons dashicons-no"></span> ' + message + '</span>');
+    $("#fallback-step-info").text("Please try again or check the error logs.");
+    
+    // Hide spinner
+    $("#fallback-progress .spinner").removeClass("is-active");
+    
+    // Re-enable buttons and restore text
+    $("#start-export, #start-fallback-export").prop('disabled', false).removeClass('button-disabled');
+    $("#start-fallback-export").html('<?php esc_html_e("Start Export - Fallback", "custom-migrator"); ?>');
+    
+    // Show error notification
+    if (typeof showError === 'function') {
+        showError("Fallback export failed: " + message);
+    } else {
+        alert("Fallback export failed: " + message);
+    }
+}
+
+
+
 jQuery(document).ready(function($) {
     // Enhanced status tracking variables
     var statusCheckInterval = null;

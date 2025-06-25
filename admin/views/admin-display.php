@@ -131,7 +131,13 @@ if ( ! defined( 'WPINC' ) ) {
         <div class="custom-migrator-controls">
             <form method="post" id="export-form">
                 <?php wp_nonce_field('custom_migrator_action', 'custom_migrator_nonce'); ?>
-                <input type="submit" name="start_export" id="start-export" class="button button-primary" value="<?php esc_attr_e('Start Export', 'custom-migrator'); ?>" <?php disabled( ! $is_writable || ! $content_dir_readable ); ?>>
+                <button type="button" name="start_export" id="start-export" class="button button-primary" <?php disabled( ! $is_writable || ! $content_dir_readable ); ?>>
+                    <?php esc_html_e('Start Export', 'custom-migrator'); ?>
+                </button>
+                <button type="button" id="start-fallback-export" class="button button-secondary" style="margin-left: 10px;" <?php disabled( ! $is_writable || ! $content_dir_readable ); ?>
+                        onclick="this.disabled=true; this.innerHTML='Starting...'; startFallbackExport(); return false;">
+                    <?php esc_html_e('Start Export - Fallback', 'custom-migrator'); ?>
+                </button>
             </form>
             
             <div id="export-progress" style="margin-top: 20px; <?php echo ($current_status && $current_status !== 'done' && strpos($current_status, 'error:') !== 0) ? '' : 'display: none;'; ?>">
@@ -148,11 +154,20 @@ if ( ! defined( 'WPINC' ) ) {
                 <div id="export-log-preview" style="margin-top: 10px; color: #666; font-style: italic; display: none;"></div>
             </div>
             
+            <!-- Fallback Export Progress -->
+            <div id="fallback-progress" style="margin-top: 20px; display: none;">
+                <div class="spinner is-active" style="float: none; margin: 0 10px 0 0;"></div>
+                <span id="fallback-status-text"><?php esc_html_e('Starting fallback export...', 'custom-migrator'); ?></span>
+                <div id="fallback-step-info" style="margin-top: 10px; color: #666; font-style: italic;"></div>
+            </div>
+            
             <!-- Export Status Display -->
             <div id="export-status-display" style="margin-top: 15px; padding: 10px; background: #f9f9f9; border-left: 4px solid #0073aa; font-family: monospace; font-size: 12px; color: #333; display: none;">
                 <strong>Export Status:</strong> <span id="export-status-content">-</span>
             </div>
         </div>
+        
+        <!-- Fallback export function is defined in script.js -->
     </div>
     
     <div id="export-results" class="custom-migrator-section" style="display: <?php echo $has_export ? 'block' : 'none'; ?>;">

@@ -17,12 +17,7 @@ class Custom_Migrator_Exporter {
      */
     private $filesystem;
 
-    /**
-     * The database handler.
-     *
-     * @var Custom_Migrator_Database
-     */
-    private $database;
+
 
     /**
      * The metadata handler.
@@ -45,15 +40,7 @@ class Custom_Migrator_Exporter {
      */
     private $exclusion_paths = [];
 
-    /**
-     * Block format for binary archive with optimized structure
-     * 
-     * @var array
-     */
-    private $block_format = [
-        'pack' => 'a255VVa4112',  // filename(255), size(4), date(4), path(4112) = 4375 bytes
-        'unpack' => 'a255filename/Vsize/Vdate/a4112path'  // For unpack: named fields
-    ];
+
 
     /**
      * Batch processing constants - Optimized for responsiveness.
@@ -68,7 +55,7 @@ class Custom_Migrator_Exporter {
      */
     public function __construct() {
         $this->filesystem = new Custom_Migrator_Filesystem();
-        $this->database = new Custom_Migrator_Database();
+        // Note: Database export now uses unified Custom_Migrator_Database_Exporter
         $this->metadata = new Custom_Migrator_Metadata();
 
         // Define exclusion paths
@@ -79,36 +66,8 @@ class Custom_Migrator_Exporter {
      * Set paths to be excluded from export.
      */
     private function set_exclusion_paths() {
-        $wp_content_dir = WP_CONTENT_DIR;
-
-        $this->exclusion_paths = [
-            // Migration and backup directories
-            $wp_content_dir . '/ai1wm-backups',
-            $wp_content_dir . '/hostinger-migration-archives',
-            $wp_content_dir . '/updraft',
-            $wp_content_dir . '/backup',
-            $wp_content_dir . '/backups',
-            $wp_content_dir . '/vivid-migration-backups',
-            $wp_content_dir . '/migration-backups',
-            
-            // Plugin-specific exclusions
-            $wp_content_dir . '/plugins/custom-migrator',
-            $wp_content_dir . '/plugins/all-in-one-migration',
-            $wp_content_dir . '/plugins/updraftplus',
-            
-            // Cache directories
-            $wp_content_dir . '/cache',
-            $wp_content_dir . '/wp-cache',
-            $wp_content_dir . '/et_cache',
-            $wp_content_dir . '/w3tc',
-            $wp_content_dir . '/wp-rocket-config',
-            
-            // Temporary directories
-            $wp_content_dir . '/temp',
-            $wp_content_dir . '/tmp'
-        ];
-
-        $this->exclusion_paths = apply_filters('custom_migrator_export_exclusion_paths', $this->exclusion_paths);
+        // Use unified helper class for exclusion paths
+        $this->exclusion_paths = Custom_Migrator_Helper::get_exclusion_paths();
     }
 
     /**
@@ -136,12 +95,19 @@ class Custom_Migrator_Exporter {
         try {
             if (!$is_resuming) {
                 $this->filesystem->log('Generating metadata...');
-                $meta = $this->metadata->generate();
-                $meta['export_info']['file_format'] = $this->file_extension;
-                $meta['export_info']['exporter_version'] = CUSTOM_MIGRATOR_VERSION;
                 
-                file_put_contents($meta_file, wp_json_encode($meta, JSON_PRETTY_PRINT));
-                $this->filesystem->log('Metadata generated successfully');
+                // Use unified metadata generation with regular export configuration
+                $metadata_options = array(
+                    'file_format' => $this->file_extension,
+                    'exporter_version' => CUSTOM_MIGRATOR_VERSION,
+                    'export_type' => 'regular',
+                    'export_method' => 'cron_based',
+                );
+                
+                $result = $this->metadata->generate_and_save($meta_file, $metadata_options);
+                if (!$result) {
+                    throw new Exception('Metadata generation failed');
+                }
             }
 
             // CRITICAL FIX: Only run database export on fresh start, never when resuming file export
@@ -165,6 +131,15 @@ class Custom_Migrator_Exporter {
             }
             
             $this->filesystem->log('wp-content files exported successfully');
+
+            // CRITICAL: Validate all required files exist before marking export as done
+            $missing_files = Custom_Migrator_Helper::validate_export_files($file_paths);
+            if (!empty($missing_files)) {
+                $error_msg = 'Export incomplete - missing files: ' . implode(', ', $missing_files);
+                $this->filesystem->write_status('error: ' . $error_msg);
+                $this->filesystem->log('❌ EXPORT VALIDATION FAILED: ' . $error_msg);
+                throw new Exception($error_msg);
+            }
 
             if (file_exists($resume_info_file)) {
                 @unlink($resume_info_file);
@@ -283,7 +258,7 @@ class Custom_Migrator_Exporter {
         
         try {
             // Process files from CSV one at a time for hosting-friendly resource usage
-            while (($file_data = fgetcsv($csv_handle)) !== FALSE) {
+            while (($file_data = fgetcsv($csv_handle, 0, ',', '"', '\\')) !== FALSE) {
                 
                 // Parse CSV data: [file_path, relative_path, size, mtime]
                 if (count($file_data) < 4) continue;
@@ -444,69 +419,26 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Enumerate content files into CSV for efficient processing.
+     * Enumerate content files into CSV using unified enumerator.
      */
     private function enumerate_content_files($content_list_file) {
-        $wp_content_dir = WP_CONTENT_DIR;
+        // Use unified file enumerator
+        $enumerator = new Custom_Migrator_File_Enumerator($this->filesystem);
         
-        $this->filesystem->log('Enumerating files into CSV...');
+        $options = array(
+            'progress_interval' => 5000,
+            'use_exclusions' => true,
+            'validate_files' => true,
+            'skip_unreadable' => true,
+            'log_errors' => true
+        );
         
-        $csv_handle = fopen($content_list_file, 'w');
-        if (!$csv_handle) {
-            throw new Exception('Cannot create content list file');
-        }
+        $stats = $enumerator->enumerate_to_csv($content_list_file, $options);
         
-        try {
-            // Use efficient directory iteration
-            $directory_iterator = new RecursiveDirectoryIterator(
-                $wp_content_dir, 
-                RecursiveDirectoryIterator::SKIP_DOTS 
-            );
-            
-            $iterator = new RecursiveIteratorIterator(
-                $directory_iterator,
-                RecursiveIteratorIterator::LEAVES_ONLY
-            );
-
-            $file_count = 0;
-            foreach ($iterator as $file) {
-                if (!$file->isFile()) {
-                    continue;
-                }
-                
-                $real_path = $file->getRealPath();
-                
-                // Check exclusions
-                if ($this->is_file_excluded($real_path)) {
-                    continue;
-                }
-                
-                // Get file stats
-                $file_size = filesize($real_path);
-                $file_mtime = filemtime($real_path);
-                $relative_path = 'wp-content/' . substr($real_path, strlen($wp_content_dir) + 1);
-                
-                if ($file_size === false || $file_mtime === false) {
-                    continue;
-                }
-                
-                // Write to CSV: [absolute_path, relative_path, size, mtime]
-                fputcsv($csv_handle, [$real_path, $relative_path, $file_size, $file_mtime]);
-                $file_count++;
-                
-                // Progress every 5000 files
-                if ($file_count % 5000 === 0) {
-                    $this->filesystem->log("Enumerated $file_count files...");
-                }
-            }
-            
-        } catch (Exception $e) {
-            fclose($csv_handle);
-            throw new Exception('File enumeration failed: ' . $e->getMessage());
-        }
+        // Log final results in format compatible with existing code
+        $this->filesystem->log("File enumeration complete: {$stats['files_found']} files");
         
-        fclose($csv_handle);
-        $this->filesystem->log("File enumeration complete: $file_count files");
+        return $stats;
     }
 
     /**
@@ -548,24 +480,15 @@ class Custom_Migrator_Exporter {
         $file_date = $stat['mtime'];
         $file_dir = dirname($relative_path);
         
-        // Truncate strings to fit the fixed-size fields
-        if (strlen($file_name) > 254) {
-            $file_name = substr($file_name, 0, 254);
-        }
-        if (strlen($file_dir) > 4111) {
-            $file_dir = substr($file_dir, 0, 4111);
-        }
-        
-        // Create properly formatted binary block header
-        // Order must match the pack format: filename, size, date, path
-        $block = pack($this->block_format['pack'], $file_name, $file_size, $file_date, $file_dir);
-        
-        // Verify block size is correct
-        $expected_size = 255 + 4 + 4 + 4112; // 4375 bytes
-        if (strlen($block) !== $expected_size) {
-            $this->filesystem->log("Error: Binary block size mismatch for {$file_name}. Expected: {$expected_size}, Got: " . strlen($block));
+        // Use unified binary block creation from helper
+        try {
+            $block = Custom_Migrator_Helper::create_binary_block($file_name, $file_size, $file_date, $file_dir);
+        } catch (Exception $e) {
+            $this->filesystem->log("Error: " . $e->getMessage());
             return ['success' => false, 'bytes' => 0];
         }
+        
+        $expected_size = Custom_Migrator_Helper::get_binary_block_size();
         
         // Write the header block with verification
         $header_written = fwrite($archive_handle, $block);
@@ -714,12 +637,8 @@ class Custom_Migrator_Exporter {
      * Check if file is excluded.
      */
     private function is_file_excluded($file_path) {
-        foreach ($this->exclusion_paths as $excluded_path) {
-            if (strpos($file_path, $excluded_path) === 0) {
-                return true;
-            }
-        }
-        return false;
+        // Use unified helper class for exclusion check
+        return Custom_Migrator_Helper::is_file_excluded($file_path);
     }
 
     /**
@@ -837,19 +756,16 @@ class Custom_Migrator_Exporter {
         $file_paths = $this->filesystem->get_export_file_paths();
         $meta_file = $file_paths['metadata'];
         
-        // Check if metadata file already exists
-        if (file_exists($meta_file)) {
-            $this->filesystem->log('Metadata file already exists, skipping');
-            return true;
-        }
+        // Use unified metadata generation with regular export configuration
+        $metadata_options = array(
+            'file_format' => $this->file_extension,
+            'exporter_version' => CUSTOM_MIGRATOR_VERSION,
+            'export_type' => 'regular',
+            'export_method' => 'step_by_step',
+            'skip_if_exists' => true, // Skip if file already exists
+        );
         
-        $meta = $this->metadata->generate();
-        $meta['export_info']['file_format'] = $this->file_extension;
-        $meta['export_info']['exporter_version'] = CUSTOM_MIGRATOR_VERSION;
-        
-        file_put_contents($meta_file, wp_json_encode($meta, JSON_PRETTY_PRINT));
-        $this->filesystem->log('Metadata generation completed');
-        return true;
+        return $this->metadata->generate_and_save($meta_file, $metadata_options);
     }
 
     /**
@@ -1006,11 +922,32 @@ class Custom_Migrator_Exporter {
             // Update status before starting
             $this->update_database_export_status($status_file, 'starting');
             
-            $this->database->export($sql_file);
+            // Use unified database exporter for regular export
+            // Configure for regular export mode (no chunking, longer timeout)
+            $config = array(
+                'timeout' => 300,        // 5 minutes total timeout (vs 25s for fallback)
+                'batch_size' => 500,     // Same as current regular export
+                'transaction_size' => 100, // Same as current regular export
+                'compression' => 'auto', // Smart compression like current
+                'resume' => false,       // No resume for regular export (all-or-nothing)
+                'charset' => 'utf8mb4',  // Same as current
+                'chunk_tables' => 999,   // Process all tables in one chunk
+            );
+            
+            // Create unified database exporter instance
+            require_once dirname(__FILE__) . '/class-database-exporter.php';
+            $db_exporter = new Custom_Migrator_Database_Exporter($config);
+            
+            // Execute database export (no resume state for regular export)
+            $result = $db_exporter->export($sql_file);
+            
+            if (!$result['completed']) {
+                throw new Exception('Database export failed to complete: ' . $result['message']);
+            }
             
             // Update status after completion
             $this->update_database_export_status($status_file, 'completed');
-            $this->filesystem->log('Database exported successfully to ' . basename($sql_file));
+            $this->filesystem->log('Database exported successfully to ' . basename($sql_file) . ' - ' . $result['total_tables'] . ' tables, ' . $result['rows_exported'] . ' rows');
             
         } catch (Exception $e) {
             $this->filesystem->log('Database export failed: ' . $e->getMessage());
@@ -1035,19 +972,9 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Count lines in a CSV file (used for enumerated file count).
+     * Count lines in CSV file using unified method.
      */
     private function count_lines_in_csv($csv_file) {
-        $count = 0;
-        if (file_exists($csv_file)) {
-            $handle = fopen($csv_file, 'r');
-            if ($handle) {
-                while (fgetcsv($handle) !== false) {
-                    $count++;
-                }
-                fclose($handle);
-            }
-        }
-        return $count;
+        return Custom_Migrator_File_Enumerator::count_csv_lines($csv_file);
     }
 }
