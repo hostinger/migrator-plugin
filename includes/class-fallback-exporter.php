@@ -451,6 +451,11 @@ class Custom_Migrator_Fallback_Exporter {
         $timeout_seconds = apply_filters('custom_migrator_timeout', 30);
         $completed = true;
         
+        // CRITICAL: Track failed files to prevent incomplete backups
+        $files_failed = 0;
+        $bytes_failed = 0;
+        $total_files_attempted = 0;
+        
         // Process files in chunks with timeout protection
         while (($file_data = fgetcsv($content_list, 0, ',', '"', '\\')) !== false) {
             $csv_lines_processed++; // Track CSV lines processed for accurate resume
@@ -474,6 +479,7 @@ class Custom_Migrator_Fallback_Exporter {
                 'size' => (int)$size
             ];
             
+            $total_files_attempted++;
             $result = $this->fallback_add_file_to_archive_direct($archive_handle, $file_info);
             
             if ($result['success']) {
@@ -488,7 +494,29 @@ class Custom_Migrator_Fallback_Exporter {
                     $this->filesystem->log("Batch progress: $files_processed/$total_files files ($progress%) processed, $skipped skipped/failed...");
                 }
             } else {
+                // CRITICAL: Track failed files and their impact
+                $files_failed++;
+                $bytes_failed += (int)$size;
                 $this->filesystem->log("Warning: Failed to process file: " . basename($full_path));
+                
+                // FAIL FAST: If too many files are failing, stop the export immediately
+                if ($files_failed >= 100) {
+                    $failure_rate = ($files_failed / $total_files_attempted) * 100;
+                    $failed_size_mb = $bytes_failed / (1024 * 1024);
+                    
+                    $error_msg = sprintf(
+                        'Fallback export FAILED: %d files failed to archive (%.1f%% failure rate, %.2f MB lost). ' .
+                        'Latest failure: %s. This backup would be incomplete and unreliable.',
+                        $files_failed,
+                        $failure_rate,
+                        $failed_size_mb,
+                        basename($full_path)
+                    );
+                    
+                    $this->filesystem->write_status('error: ' . $error_msg);
+                    $this->filesystem->log('❌ FALLBACK EXPORT TERMINATED DUE TO EXCESSIVE FAILURES: ' . $error_msg);
+                    throw new Exception($error_msg);
+                }
             }
             
                     // Check timeout or batch size limits
@@ -771,7 +799,6 @@ class Custom_Migrator_Fallback_Exporter {
                 'exporter_version' => CUSTOM_MIGRATOR_VERSION,
                 'export_type' => 'fallback',
                 'export_method' => 'ajax_chunked',
-                'skip_if_exists' => true, // Skip if file already exists
                 'custom_fields' => array(
                     'files_processed' => isset($params['files_processed']) ? (int)$params['files_processed'] : 0,
                     'bytes_processed' => isset($params['bytes_processed']) ? (int)$params['bytes_processed'] : 0,
