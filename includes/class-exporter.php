@@ -256,6 +256,11 @@ class Custom_Migrator_Exporter {
         // Track files processed in this batch for accurate rate calculation
         $files_processed_this_batch = 0;
         
+        // CRITICAL: Track failed files to prevent incomplete backups
+        $files_failed = 0;
+        $bytes_failed = 0;
+        $total_files_attempted = 0;
+        
         try {
             // Process files from CSV one at a time for hosting-friendly resource usage
             while (($file_data = fgetcsv($csv_handle, 0, ',', '"', '\\')) !== FALSE) {
@@ -280,57 +285,81 @@ class Custom_Migrator_Exporter {
                     'size' => $file_size
                 ];
                 
+                $total_files_attempted++;
                 $result = $this->add_file_to_archive($archive_handle, $file_info);
                 
                 if ($result['success']) {
                     $files_processed++;
                     $files_processed_this_batch++;
                     $bytes_processed += $result['bytes'];
+                } else {
+                    // CRITICAL: Track failed files and their impact
+                    $files_failed++;
+                    $bytes_failed += $file_size;
                     
-                    // Progress logging every 1000 files
-                    if ($files_processed % 1000 === 0) {
-                        $elapsed = microtime(true) - $start;
-                        $batch_rate = $files_processed_this_batch / max($elapsed, 1);
-                        $mode_desc = $cron_mode ? "Cron" : "HTTP";
-                        $this->filesystem->log(sprintf(
-                            "Processing: %d files (%.2f MB). Batch Rate: %.2f files/sec (%d files in %.1fs) [%s Mode - %ds timeout]",
-                            $files_processed,
-                            $bytes_processed / (1024 * 1024),
-                            $batch_rate,
-                            $files_processed_this_batch,
-                            $elapsed,
-                            $mode_desc,
-                            $adaptive_timeout
-                        ));
-                    }
-                    
-                    // LVE THROTTLING DETECTION: Check every 100 files for performance degradation
-                    if ($files_processed % 100 === 0) {
-                        static $last_lve_check = null;
-                        static $last_lve_files = 0;
+                    // FAIL FAST: If too many files are failing, stop the export immediately
+                    if ($files_failed >= 100) {
+                        $failure_rate = ($files_failed / $total_files_attempted) * 100;
+                        $failed_size_mb = $bytes_failed / (1024 * 1024);
                         
-                        if ($last_lve_check !== null) {
-                            $time_since_check = microtime(true) - $last_lve_check;
-                            $files_since_check = $files_processed - $last_lve_files;
-                            $recent_rate = $files_since_check / max($time_since_check, 1);
+                        $error_msg = sprintf(
+                            'Export FAILED: %d files failed to archive (%.1f%% failure rate, %.2f MB lost). ' .
+                            'Latest failure: %s. This backup would be incomplete and unreliable.',
+                            $files_failed,
+                            $failure_rate,
+                            $failed_size_mb,
+                            basename($file_path)
+                        );
+                        
+                        $this->filesystem->write_status('error: ' . $error_msg);
+                        $this->filesystem->log('❌ EXPORT TERMINATED DUE TO EXCESSIVE FAILURES: ' . $error_msg);
+                        throw new Exception($error_msg);
+                    }
+                }
+                
+                // Progress logging every 1000 files
+                if ($files_processed % 1000 === 0) {
+                    $elapsed = microtime(true) - $start;
+                    $batch_rate = $files_processed_this_batch / max($elapsed, 1);
+                    $mode_desc = $cron_mode ? "Cron" : "HTTP";
+                    $this->filesystem->log(sprintf(
+                        "Processing: %d files (%.2f MB). Batch Rate: %.2f files/sec (%d files in %.1fs) [%s Mode - %ds timeout]",
+                        $files_processed,
+                        $bytes_processed / (1024 * 1024),
+                        $batch_rate,
+                        $files_processed_this_batch,
+                        $elapsed,
+                        $mode_desc,
+                        $adaptive_timeout
+                    ));
+                }
+                
+                // LVE THROTTLING DETECTION: Check every 100 files for performance degradation
+                if ($files_processed % 100 === 0) {
+                    static $last_lve_check = null;
+                    static $last_lve_files = 0;
+                    
+                    if ($last_lve_check !== null) {
+                        $time_since_check = microtime(true) - $last_lve_check;
+                        $files_since_check = $files_processed - $last_lve_files;
+                        $recent_rate = $files_since_check / max($time_since_check, 1);
+                        
+                        // If processing rate drops below 5 files/sec, likely LVE throttling
+                        if ($recent_rate < 5 && $files_since_check >= 100) {
+                            $this->filesystem->log(sprintf(
+                                "⚠️ LVE THROTTLING DETECTED: Rate=%.1f files/sec (last 100 files took %.1fs) - will pause early to avoid limits",
+                                $recent_rate,
+                                $time_since_check
+                            ));
                             
-                            // If processing rate drops below 5 files/sec, likely LVE throttling
-                            if ($recent_rate < 5 && $files_since_check >= 100) {
-                                $this->filesystem->log(sprintf(
-                                    "⚠️ LVE THROTTLING DETECTED: Rate=%.1f files/sec (last 100 files took %.1fs) - will pause early to avoid limits",
-                                    $recent_rate,
-                                    $time_since_check
-                                ));
-                                
-                                // Force early timeout to avoid hitting harder LVE limits
-                                $completed = false;
-                                break;
-                            }
+                            // Force early timeout to avoid hitting harder LVE limits
+                            $completed = false;
+                            break;
                         }
-                        
-                        $last_lve_check = microtime(true);
-                        $last_lve_files = $files_processed;
                     }
+                    
+                    $last_lve_check = microtime(true);
+                    $last_lve_files = $files_processed;
                 }
                 
                 // Check adaptive timeout after each file
@@ -392,23 +421,36 @@ class Custom_Migrator_Exporter {
             $completion_rate = $total_files_enumerated > 0 ? ($files_processed / $total_files_enumerated) : 1;
             if ($total_files_enumerated > 0 && $completion_rate < 0.99) {
                 $missing = $total_files_enumerated - $files_processed;
+                $failed_size_mb = isset($bytes_failed) ? $bytes_failed / (1024 * 1024) : 0;
+                $failed_count = isset($files_failed) ? $files_failed : 0;
+                
                 $error_msg = sprintf(
-                    'Export incomplete: Only %d of %d files exported (%.1f%%). Missing %d files.',
+                    'Export incomplete: Only %d of %d files exported (%.1f%%). Missing %d files. ' .
+                    'Failed files: %d (%.2f MB lost). This backup is unreliable.',
                     $files_processed,
                     $total_files_enumerated,
                     $completion_rate * 100,
-                    $missing
+                    $missing,
+                    $failed_count,
+                    $failed_size_mb
                 );
                 $this->filesystem->write_status('error: ' . $error_msg);
                 $this->filesystem->log('❌ EXPORT VALIDATION FAILED: ' . $error_msg);
                 throw new Exception($error_msg);
             } else {
                 $total_time = microtime(true) - $start;
+                $failed_info = '';
+                if (isset($files_failed) && $files_failed > 0) {
+                    $failed_size_mb = $bytes_failed / (1024 * 1024);
+                    $failed_info = sprintf(' (Warning: %d files failed, %.2f MB lost)', $files_failed, $failed_size_mb);
+                }
+                
                 $this->filesystem->log(sprintf(
-                    'Single-file processing completed: %d files (%.2f MB) in %.2f seconds',
+                    'Single-file processing completed: %d files (%.2f MB) in %.2f seconds%s',
                     $files_processed,
                     $bytes_processed / (1024 * 1024),
-                    $total_time
+                    $total_time,
+                    $failed_info
                 ));
                 $this->filesystem->write_status('done');
                 $this->filesystem->log('Export completed successfully');
@@ -762,7 +804,6 @@ class Custom_Migrator_Exporter {
             'exporter_version' => CUSTOM_MIGRATOR_VERSION,
             'export_type' => 'regular',
             'export_method' => 'step_by_step',
-            'skip_if_exists' => true, // Skip if file already exists
         );
         
         return $this->metadata->generate_and_save($meta_file, $metadata_options);

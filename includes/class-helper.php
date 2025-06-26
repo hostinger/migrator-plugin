@@ -82,7 +82,7 @@ class Custom_Migrator_Helper {
             $wp_content_dir . '/mu-plugins/0-sqlite.php', // SQLite zero config
             
             // Plugin-specific cache and generated files (following AI1WM)
-            $wp_content_dir . '/uploads/elementor/css', // Elementor CSS cache
+            // NOTE: Removed elementor/css exclusion - these files are essential for website styling
             $wp_content_dir . '/uploads/civicrm', // CiviCRM uploads
             
             // Temporary directories

@@ -223,14 +223,6 @@ class Custom_Migrator_File_Enumerator {
         // Calculate relative path
         $relative_path = $this->calculate_relative_path($real_path, $config);
         
-        // DEBUG: Log corruption detection for plugins files
-        if (strpos($real_path, '/plugins/') !== false && strpos($relative_path, '/ins/') !== false) {
-            $this->filesystem->log("❌ PATH CORRUPTION DETECTED:");
-            $this->filesystem->log("  Real path: $real_path");
-            $this->filesystem->log("  Relative path: $relative_path");
-            $this->filesystem->log("  Expected: should contain '/plugins/', got '/ins/'");
-        }
-        
         // Prepare CSV data: [absolute_path, relative_path, size, mtime]
         $result['csv_data'] = array($real_path, $relative_path, $file_size, $file_mtime);
         $result['size'] = $file_size;
@@ -239,11 +231,11 @@ class Custom_Migrator_File_Enumerator {
     }
 
     /**
-     * Calculate relative path for the file.
+     * Calculate relative path from real path based on configuration.
      *
-     * @param string $real_path Full file path.
+     * @param string $real_path The absolute file path.
      * @param array  $config    Configuration options.
-     * @return string Relative path.
+     * @return string The relative path for the archive.
      */
     private function calculate_relative_path($real_path, $config) {
         $source_dir = rtrim($config['source_dir'], DIRECTORY_SEPARATOR);
@@ -252,16 +244,6 @@ class Custom_Migrator_File_Enumerator {
         // Normalize paths for comparison (resolve symlinks, handle different prefixes)
         $real_path_normalized = realpath($real_path);
         $source_dir_normalized = realpath($source_dir);
-        
-        // DEBUG: Log detailed path calculation for plugins files
-        if (strpos($real_path, '/plugins/') !== false) {
-            $this->filesystem->log("🔍 PATH CALCULATION DEBUG:");
-            $this->filesystem->log("  Input real_path: '$real_path'");
-            $this->filesystem->log("  Normalized real_path: '$real_path_normalized'");
-            $this->filesystem->log("  Config source_dir: '{$config['source_dir']}'");
-            $this->filesystem->log("  Normalized source_dir: '$source_dir_normalized'");
-            $this->filesystem->log("  Base name: '$base_name'");
-        }
         
         // Use normalized paths if available, fallback to original
         $path_to_process = $real_path_normalized ?: $real_path;
@@ -281,31 +263,12 @@ class Custom_Migrator_File_Enumerator {
                 // Found the source directory name in the path
                 $relative_part = substr($path_to_process, $source_pos + strlen($source_suffix) + 2);
             } else {
-                // Last resort: use the original method but log the issue
+                // Last resort: use the original method
                 $relative_part = substr($real_path, strlen($source_dir) + 1);
-                if (strpos($real_path, '/plugins/') !== false) {
-                    $this->filesystem->log("  ⚠️  Using fallback method - paths don't align properly");
-                }
             }
-        }
-        
-        // DEBUG: Continue logging for plugins files
-        if (strpos($real_path, '/plugins/') !== false) {
-            $this->filesystem->log("  Extracted relative_part: '$relative_part'");
         }
         
         $final_path = $base_name . '/' . str_replace(DIRECTORY_SEPARATOR, '/', $relative_part);
-        
-        // DEBUG: Final result for plugins files
-        if (strpos($real_path, '/plugins/') !== false) {
-            $this->filesystem->log("  Final result: '$final_path'");
-            if (strpos($final_path, '/ins/') !== false) {
-                $this->filesystem->log("  ❌ CORRUPTION DETECTED IN CALCULATION!");
-            } else {
-                $this->filesystem->log("  ✅ Path calculation successful");
-            }
-            $this->filesystem->log(""); // Empty line for readability
-        }
         
         return $final_path;
     }

@@ -129,6 +129,9 @@ class Custom_Migrator_Metadata {
                 'server_software'    => isset( $_SERVER['SERVER_SOFTWARE'] ) ? $_SERVER['SERVER_SOFTWARE'] : '',
                 'os'                 => PHP_OS,
             ),
+            'source_paths' => array(
+                'abspath' => rtrim( ABSPATH, '/' ),
+            ),
         );
 
         // Apply any provided options to override defaults
@@ -185,17 +188,14 @@ class Custom_Migrator_Metadata {
         try {
             $this->filesystem->log('Generating metadata file: ' . basename($file_path));
             
-            // Check if metadata file already exists and skip if requested
-            if (file_exists($file_path) && isset($options['skip_if_exists']) && $options['skip_if_exists']) {
-                $this->filesystem->log('Metadata file already exists, skipping generation');
-                return true;
-            }
+            // Always regenerate metadata to ensure source_paths are included
+            // (Removed skip_if_exists logic to fix missing source_paths issue)
             
             // Generate metadata with options
             $metadata = $this->generate($options);
             
-            // Save to file with pretty formatting
-            $json_content = wp_json_encode($metadata, JSON_PRETTY_PRINT);
+            // Save to file with pretty formatting and unescaped slashes
+            $json_content = wp_json_encode($metadata, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
             $result = file_put_contents($file_path, $json_content);
             
             if ($result === false) {
