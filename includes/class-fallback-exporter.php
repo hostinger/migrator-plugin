@@ -351,15 +351,16 @@ class Custom_Migrator_Fallback_Exporter {
      * Enumerate content files into CSV using unified enumerator.
      */
     private function enumerate_content_files($content_list_file) {
-        // Use unified file enumerator (same as regular export)
+        // Use unified file enumerator with unlimited execution environment (same as regular export)
         $enumerator = new Custom_Migrator_File_Enumerator($this->filesystem);
         
         $options = array(
-            'progress_interval' => 5000,
+            'progress_interval' => 1000,  // More frequent progress updates
             'use_exclusions' => true,
             'validate_files' => true,
             'skip_unreadable' => true,
-            'log_errors' => true
+            'log_errors' => true,
+            'use_unlimited_execution' => true  // Enable unlimited execution time for enumeration
         );
         
         $stats = $enumerator->enumerate_to_csv($content_list_file, $options);
@@ -415,58 +416,58 @@ class Custom_Migrator_Fallback_Exporter {
             throw new Exception('Content list file not found');
         }
         
-        // Get resume parameters
+        // Get resume parameters - EXACTLY like regular export
         $files_processed = isset($params['files_processed']) ? (int)$params['files_processed'] : 0;
         $bytes_processed = isset($params['bytes_processed']) ? (int)$params['bytes_processed'] : 0;
-        $csv_lines_processed = isset($params['csv_lines_processed']) ? (int)$params['csv_lines_processed'] : 0;
+        $csv_offset = isset($params['csv_offset']) ? (int)$params['csv_offset'] : 0;
+        $archive_offset = isset($params['archive_offset']) ? (int)$params['archive_offset'] : 0;
         $total_files = isset($params['file_count']) ? (int)$params['file_count'] : $this->count_lines_in_csv($content_list_path);
         
-        // ENHANCED: Log resume information for debugging
+        // Log resume information for debugging
         if ($files_processed > 0) {
-            $this->filesystem->log("Resuming archive creation: $files_processed files processed, $csv_lines_processed CSV lines processed");
+            $this->filesystem->log("Resuming archive creation: $files_processed files processed, CSV offset: $csv_offset, archive offset: $archive_offset");
         }
         
-        // Open archive file (append mode for resume)
-        $archive_handle = fopen($archive_path, $files_processed > 0 ? 'ab' : 'wb');
-        if (!$archive_handle) {
-            throw new Exception('Cannot create archive file');
-        }
-        
-        // Open content list
+        // Open content list first
         $content_list = fopen($content_list_path, 'r');
         if (!$content_list) {
-            fclose($archive_handle);
             throw new Exception('Cannot read content list file');
         }
         
-        // FIXED: Skip CSV lines instead of seeking by byte position (more reliable)
-        $current_csv_line = 0;
-        while ($current_csv_line < $csv_lines_processed && !feof($content_list)) {
-            fgetcsv($content_list, 0, ',', '"', '\\'); // Skip this line
-            $current_csv_line++;
+        // Seek to CSV offset if resuming - EXACTLY like regular export
+        if ($csv_offset > 0) {
+            fseek($content_list, $csv_offset);
         }
+        
+        // Open archive file
+        $archive_mode = $archive_offset > 0 ? 'ab' : 'wb';
+        $archive_handle = fopen($archive_path, $archive_mode);
+        if (!$archive_handle) {
+            fclose($content_list);
+            throw new Exception('Cannot create archive file');
+        }
+        
+        // CRITICAL FIX: Don't seek when using append mode!
+        // Append mode ('ab') automatically positions at end of file
+        // The fseek() was causing corruption by seeking to wrong position
+        // if ($archive_offset > 0) {
+        //     fseek($archive_handle, $archive_offset);
+        // }
         
         $files_in_batch = 0;
         $max_batch_size = apply_filters('custom_migrator_max_files_per_batch', 500);
         $timeout_seconds = apply_filters('custom_migrator_timeout', 30);
         $completed = true;
         
-        // CRITICAL: Track failed files to prevent incomplete backups
-        $files_failed = 0;
-        $bytes_failed = 0;
-        $total_files_attempted = 0;
-        
         // Process files in chunks with timeout protection
         while (($file_data = fgetcsv($content_list, 0, ',', '"', '\\')) !== false) {
-            $csv_lines_processed++; // Track CSV lines processed for accurate resume
-            
             if (count($file_data) < 4) {
-                continue; // Skip malformed CSV lines but still count them
+                continue; // Skip malformed lines
             }
             
             list($full_path, $relative_path, $size, $mtime) = $file_data;
             
-            // Skip if file no longer exists (but still count the CSV line as processed)
+            // Skip if file no longer exists
             if (!file_exists($full_path) || !is_readable($full_path)) {
                 $this->filesystem->log("Warning: Skipping missing/unreadable file: " . basename($full_path));
                 continue;
@@ -479,7 +480,6 @@ class Custom_Migrator_Fallback_Exporter {
                 'size' => (int)$size
             ];
             
-            $total_files_attempted++;
             $result = $this->fallback_add_file_to_archive_direct($archive_handle, $file_info);
             
             if ($result['success']) {
@@ -487,36 +487,13 @@ class Custom_Migrator_Fallback_Exporter {
                 $bytes_processed += $result['bytes'];
                 $files_in_batch++;
                 
-                // Progress logging every 100 files PROCESSED
+                // Progress logging every 100 files
                 if ($files_processed % 100 === 0) {
                     $progress = round(($files_processed / $total_files) * 100, 1);
-                    $skipped = $csv_lines_processed - $files_processed;
-                    $this->filesystem->log("Batch progress: $files_processed/$total_files files ($progress%) processed, $skipped skipped/failed...");
+                    $this->filesystem->log("Batch progress: $files_processed/$total_files files ($progress%) processed");
                 }
             } else {
-                // CRITICAL: Track failed files and their impact
-                $files_failed++;
-                $bytes_failed += (int)$size;
                 $this->filesystem->log("Warning: Failed to process file: " . basename($full_path));
-                
-                // FAIL FAST: If too many files are failing, stop the export immediately
-                if ($files_failed >= 100) {
-                    $failure_rate = ($files_failed / $total_files_attempted) * 100;
-                    $failed_size_mb = $bytes_failed / (1024 * 1024);
-                    
-                    $error_msg = sprintf(
-                        'Fallback export FAILED: %d files failed to archive (%.1f%% failure rate, %.2f MB lost). ' .
-                        'Latest failure: %s. This backup would be incomplete and unreliable.',
-                        $files_failed,
-                        $failure_rate,
-                        $failed_size_mb,
-                        basename($full_path)
-                    );
-                    
-                    $this->filesystem->write_status('error: ' . $error_msg);
-                    $this->filesystem->log('❌ FALLBACK EXPORT TERMINATED DUE TO EXCESSIVE FAILURES: ' . $error_msg);
-                    throw new Exception($error_msg);
-                }
             }
             
                     // Check timeout or batch size limits
@@ -527,10 +504,16 @@ class Custom_Migrator_Fallback_Exporter {
         }
     }
     
-    // FIXED: Proper completion detection - only complete if we processed all files OR reached end of CSV
+        // Check if we reached end of file
     if (!$completed && feof($content_list)) {
         $completed = true;
     }
+        
+        // Get current positions for resume
+        $current_csv_offset = ftell($content_list);
+        // Archive offset is saved for logging but NOT used for seeking
+        // We use append mode ('ab') which automatically positions at end of file
+        $current_archive_offset = ftell($archive_handle);
         
             fclose($content_list);
     fclose($archive_handle);
@@ -538,13 +521,7 @@ class Custom_Migrator_Fallback_Exporter {
     $elapsed = microtime(true) - $start_time;
     $progress = $total_files > 0 ? round(($files_processed / $total_files) * 100, 1) : 100;
     
-    // CRITICAL: Add 99% completion validation before proceeding to database
     if ($completed) {
-        // Validate completion - must have processed at least 99% of files
-        if ($total_files > 0 && $progress < 99.0) {
-            $this->filesystem->log("WARNING: Archive appears complete but only $progress% of files processed ($files_processed/$total_files). Continuing archive process...");
-            $completed = false;
-        } else {
             $this->filesystem->log("Archive completed: $files_processed files (" . $this->format_bytes($bytes_processed) . ") in " . round($elapsed, 1) . " seconds");
             
             return array(
@@ -559,12 +536,8 @@ class Custom_Migrator_Fallback_Exporter {
                     'bytes_processed' => $bytes_processed
                 ))
             );
-        }
-    }
-    
-    if (!$completed) {
-            $skipped_total = $csv_lines_processed - $files_processed;
-            $this->filesystem->log("Batch completed: $files_processed/$total_files files ($progress%), $skipped_total skipped/failed");
+        } else {
+            $this->filesystem->log("Batch completed: $files_processed/$total_files files ($progress%)");
             
             return array(
                 'completed' => false,
@@ -576,7 +549,8 @@ class Custom_Migrator_Fallback_Exporter {
                 'params' => array_merge($params, array(
                     'files_processed' => $files_processed,
                     'bytes_processed' => $bytes_processed,
-                    'csv_lines_processed' => $csv_lines_processed,
+                    'csv_offset' => $current_csv_offset,
+                    'archive_offset' => $current_archive_offset,
                     'file_count' => $total_files
                 ))
             );
@@ -594,6 +568,17 @@ class Custom_Migrator_Fallback_Exporter {
         // Enhanced file validation
         if (!file_exists($file_path) || !is_readable($file_path)) {
             return ['success' => false, 'bytes' => 0];
+        }
+        
+        // ENHANCED: Large file handling and memory management
+        $is_large_file = $file_size > 50 * 1024 * 1024; // 50MB threshold
+        if ($is_large_file) {
+            $this->filesystem->log("Processing large file: " . basename($file_path) . " (" . $this->format_bytes($file_size) . ")");
+            
+            // Force garbage collection before large file
+            if (function_exists('gc_collect_cycles')) {
+                gc_collect_cycles();
+            }
         }
         
         // Get file stats
@@ -629,7 +614,11 @@ class Custom_Migrator_Fallback_Exporter {
         }
         
         $bytes_copied = 0;
-        $chunk_size = 512000; // 512KB chunks - IDENTICAL to main export
+        $chunk_size = $is_large_file ? 256 * 1024 : 512000; // Smaller chunks for large files
+        
+        // ENHANCED: Progress tracking for large files
+        $progress_interval = $is_large_file ? (10 * 1024 * 1024) : 0; // 10MB intervals for large files
+        $last_progress = 0;
         
         while (!feof($file_handle)) {
             $chunk = fread($file_handle, $chunk_size);
@@ -644,11 +633,42 @@ class Custom_Migrator_Fallback_Exporter {
             }
             
             $bytes_copied += $written;
+            
+            // ENHANCED: Progress logging and memory management for large files
+            if ($is_large_file && $progress_interval > 0 && ($bytes_copied - $last_progress) >= $progress_interval) {
+                $progress = round(($bytes_copied / $file_size) * 100, 1);
+                $this->filesystem->log("Large file progress: {$progress}% of " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . "/" . $this->format_bytes($file_size) . ")");
+                $last_progress = $bytes_copied;
+                
+                // Force garbage collection during large file processing
+                if (function_exists('gc_collect_cycles')) {
+                    gc_collect_cycles();
+                }
+            }
         }
         
         fclose($file_handle);
         
-        return ['success' => true, 'bytes' => $bytes_copied];
+        // ENHANCED: Post-large-file memory management
+        if ($is_large_file) {
+            $this->filesystem->log("Large file completed: " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . ")");
+            
+            // Force garbage collection after large file
+            if (function_exists('gc_collect_cycles')) {
+                gc_collect_cycles();
+            }
+            
+            // Flush archive buffer to disk to free memory
+            if (function_exists('fflush')) {
+                fflush($archive_handle);
+            }
+            
+            // Brief pause to let system recover
+            usleep(100000); // 0.1 second pause
+        }
+        
+        // Return total bytes written (header + file content)
+        return ['success' => true, 'bytes' => $expected_size + $bytes_copied];
     }
 
     /**

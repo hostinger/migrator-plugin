@@ -296,7 +296,7 @@ class Custom_Migrator_Admin {
             
             // Plugin exclusions
             $wp_content_dir . '/plugins/custom-migrator',
-            $wp_content_dir . '/plugins/all-in-one-migration',
+            $wp_content_dir . '/plugins/all-in-one-wp-migration',
             $wp_content_dir . '/plugins/updraftplus',
             
             // Cache directories
@@ -304,7 +304,9 @@ class Custom_Migrator_Admin {
             $wp_content_dir . '/wp-cache',
             $wp_content_dir . '/et_cache',
             $wp_content_dir . '/w3tc',
-            $wp_content_dir . '/wp-rocket-config',
+            
+            // Plugin-specific generated files
+            $wp_content_dir . '/uploads/civicrm', // CiviCRM uploads
             
             // Temporary directories
             $wp_content_dir . '/temp',

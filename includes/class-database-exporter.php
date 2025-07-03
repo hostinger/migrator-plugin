@@ -365,7 +365,7 @@ class Custom_Migrator_Database_Exporter {
     }
 
     /**
-     * Export table structure (CREATE TABLE statement).
+     * Export table structure with collation compatibility fixes.
      *
      * @param resource $output_handle Output file handle.
      * @param string   $table Table name.
@@ -387,6 +387,10 @@ class Custom_Migrator_Database_Exporter {
         $create_table = $row[1];
         $result->free();
 
+        // Apply collation compatibility fixes for different MySQL versions.
+        // Based on All-in-One WP Migration's intelligent approach using WordPress database capabilities.
+        $create_table = $this->fix_collation_compatibility($create_table);
+
         $structure_sql = array(
             "",
             "-- --------------------------------------------------------",
@@ -405,6 +409,62 @@ class Custom_Migrator_Database_Exporter {
         }
 
         return $bytes_written;
+    }
+
+    /**
+     * Fix collation compatibility issues for different MySQL versions.
+     * Based on All-in-One WP Migration's intelligent approach using WordPress database capabilities.
+     *
+     * @param string $create_table The CREATE TABLE statement.
+     * @return string Fixed CREATE TABLE statement.
+     */
+    private function fix_collation_compatibility($create_table) {
+        global $wpdb;
+        
+        $original_create_table = $create_table;
+        
+        // Use WordPress database capability detection (like AI1WM)
+        static $search = array();
+        static $replace = array();
+        
+        // Initialize collation mappings based on target database capabilities
+        if (empty($search) || empty($replace)) {
+            if (!$wpdb->has_cap('utf8mb4_520')) {
+                if (!$wpdb->has_cap('utf8mb4')) {
+                    // MySQL < 5.5 (no UTF8MB4 support at all) - matches AI1WM exactly
+                    $search = array('utf8mb4_0900_ai_ci', 'utf8mb4_unicode_520_ci', 'utf8mb4');
+                    $replace = array('utf8_unicode_ci', 'utf8_unicode_ci', 'utf8');
+                    $this->filesystem->log("Collation compatibility: Targeting MySQL < 5.5 (no UTF8MB4 support)");
+                } else {
+                    // MySQL 5.5-5.6 (has UTF8MB4 but no 520 collation) - matches AI1WM exactly
+                    $search = array('utf8mb4_0900_ai_ci', 'utf8mb4_unicode_520_ci');
+                    $replace = array('utf8mb4_unicode_ci', 'utf8mb4_unicode_ci');
+                    $this->filesystem->log("Collation compatibility: Targeting MySQL 5.5-5.6 (UTF8MB4 without 520 collation)");
+                }
+            } else {
+                // MySQL 5.7+ (has UTF8MB4_520 support, but not 0900)
+                $search = array('utf8mb4_0900_ai_ci');
+                $replace = array('utf8mb4_unicode_520_ci');
+                $this->filesystem->log("Collation compatibility: Targeting MySQL 5.7+ (UTF8MB4_520 support)");
+            }
+        }
+
+        // Apply collation replacements
+        $replacements_made = array();
+        foreach ($search as $index => $old_collation) {
+            if (strpos($create_table, $old_collation) !== false) {
+                $new_collation = $replace[$index];
+                $create_table = str_replace($old_collation, $new_collation, $create_table);
+                $replacements_made[] = "$old_collation → $new_collation";
+            }
+        }
+
+        // Log replacements made
+        if (!empty($replacements_made)) {
+            $this->filesystem->log("Collation compatibility fixes applied: " . implode(', ', $replacements_made));
+        }
+
+        return $create_table;
     }
 
     /**
