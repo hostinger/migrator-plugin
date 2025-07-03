@@ -244,10 +244,12 @@ class Custom_Migrator_Exporter {
             throw new Exception('Cannot create or open archive file');
         }
         
-        // Seek to archive offset if resuming
-        if ($archive_offset > 0) {
-            fseek($archive_handle, $archive_offset);
-        }
+        // CRITICAL FIX: Don't seek when using append mode!
+        // Append mode ('ab') automatically positions at end of file
+        // The fseek() was causing corruption by seeking to wrong position
+        // if ($archive_offset > 0) {
+        //     fseek($archive_handle, $archive_offset);
+        // }
         
         // Start precise timing for optimal resource management
         $start = microtime(true);
@@ -376,6 +378,9 @@ class Custom_Migrator_Exporter {
                     
                     // Save CSV and archive positions for precise resume
                     $current_csv_offset = ftell($csv_handle);
+                    
+                    // Archive offset is saved for logging but NOT used for seeking
+                    // We use append mode ('ab') which automatically positions at end of file
                     $current_archive_offset = ftell($archive_handle);
                     
                     $this->save_resume_data($resume_info_file, [
@@ -464,15 +469,16 @@ class Custom_Migrator_Exporter {
      * Enumerate content files into CSV using unified enumerator.
      */
     private function enumerate_content_files($content_list_file) {
-        // Use unified file enumerator
+        // Use unified file enumerator with unlimited execution environment
         $enumerator = new Custom_Migrator_File_Enumerator($this->filesystem);
         
         $options = array(
-            'progress_interval' => 5000,
+            'progress_interval' => 1000,  // More frequent progress updates
             'use_exclusions' => true,
             'validate_files' => true,
             'skip_unreadable' => true,
-            'log_errors' => true
+            'log_errors' => true,
+            'use_unlimited_execution' => true  // Enable unlimited execution time for enumeration
         );
         
         $stats = $enumerator->enumerate_to_csv($content_list_file, $options);
@@ -510,6 +516,26 @@ class Custom_Migrator_Exporter {
             $file_info['size'] = $file_size; // Update for consistency
         }
         
+        // ENHANCED: Large file handling and memory management
+        $is_large_file = $file_size > 50 * 1024 * 1024; // 50MB threshold
+        if ($is_large_file) {
+            $this->filesystem->log("Processing large file: " . basename($file_path) . " (" . $this->format_bytes($file_size) . ")");
+            
+            // Force garbage collection before large file
+            if (function_exists('gc_collect_cycles')) {
+                gc_collect_cycles();
+            }
+            
+            // Check available memory
+            $memory_limit = $this->get_memory_limit();
+            $memory_used = memory_get_usage(true);
+            $memory_available = $memory_limit - $memory_used;
+            
+            if ($memory_available < ($file_size * 1.5)) {
+                $this->filesystem->log("Warning: Low memory for large file processing. Available: " . $this->format_bytes($memory_available) . ", File: " . $this->format_bytes($file_size));
+            }
+        }
+        
         // Get file stats
         $stat = stat($file_path);
         if ($stat === false) {
@@ -539,7 +565,7 @@ class Custom_Migrator_Exporter {
             return ['success' => false, 'bytes' => 0];
         }
         
-        // Open and copy file content with verification
+        // ENHANCED: Large file content copying with memory management
         $file_handle = fopen($file_path, 'rb');
         if (!$file_handle) {
             $this->filesystem->log("Error: Cannot open file for reading: " . basename($file_path));
@@ -547,7 +573,11 @@ class Custom_Migrator_Exporter {
         }
         
         $bytes_copied = 0;
-        $chunk_size = self::CHUNK_SIZE; // 512KB chunks
+        $chunk_size = $is_large_file ? 256 * 1024 : self::CHUNK_SIZE; // Smaller chunks for large files
+        
+        // ENHANCED: Progress tracking for large files
+        $progress_interval = $is_large_file ? (10 * 1024 * 1024) : 0; // 10MB intervals for large files
+        $last_progress = 0;
         
         while (!feof($file_handle)) {
             $chunk = fread($file_handle, $chunk_size);
@@ -570,9 +600,39 @@ class Custom_Migrator_Exporter {
             }
             
             $bytes_copied += $written;
+            
+            // ENHANCED: Progress logging and memory management for large files
+            if ($is_large_file && $progress_interval > 0 && ($bytes_copied - $last_progress) >= $progress_interval) {
+                $progress = round(($bytes_copied / $file_size) * 100, 1);
+                $this->filesystem->log("Large file progress: {$progress}% of " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . "/" . $this->format_bytes($file_size) . ")");
+                $last_progress = $bytes_copied;
+                
+                // Force garbage collection during large file processing
+                if (function_exists('gc_collect_cycles')) {
+                    gc_collect_cycles();
+                }
+            }
         }
         
         fclose($file_handle);
+        
+        // ENHANCED: Post-large-file memory management
+        if ($is_large_file) {
+            $this->filesystem->log("Large file completed: " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . ")");
+            
+            // Force garbage collection after large file
+            if (function_exists('gc_collect_cycles')) {
+                gc_collect_cycles();
+            }
+            
+            // Flush archive buffer to disk to free memory
+            if (function_exists('fflush')) {
+                fflush($archive_handle);
+            }
+            
+            // Brief pause to let system recover
+            usleep(100000); // 0.1 second pause
+        }
         
         // Final verification - ensure we copied the expected amount
         if ($bytes_copied !== $file_size) {
@@ -580,6 +640,49 @@ class Custom_Migrator_Exporter {
         }
         
         return ['success' => true, 'bytes' => $bytes_copied];
+    }
+
+    /**
+     * Get PHP memory limit in bytes.
+     */
+    private function get_memory_limit() {
+        $memory_limit = ini_get('memory_limit');
+        
+        if ($memory_limit == -1) {
+            return PHP_INT_MAX; // Unlimited
+        }
+        
+        $value = (int) $memory_limit;
+        $unit = strtolower(substr($memory_limit, -1));
+        
+        switch ($unit) {
+            case 'g':
+                $value *= 1024 * 1024 * 1024;
+                break;
+            case 'm':
+                $value *= 1024 * 1024;
+                break;
+            case 'k':
+                $value *= 1024;
+                break;
+        }
+        
+        return $value;
+    }
+
+    /**
+     * Format bytes for display
+     */
+    private function format_bytes($bytes) {
+        if ($bytes >= 1073741824) {
+            return round($bytes / 1073741824, 2) . ' GB';
+        } elseif ($bytes >= 1048576) {
+            return round($bytes / 1048576, 2) . ' MB';
+        } elseif ($bytes >= 1024) {
+            return round($bytes / 1024, 2) . ' KB';
+        } else {
+            return $bytes . ' bytes';
+        }
     }
 
     /**
@@ -676,14 +779,6 @@ class Custom_Migrator_Exporter {
     }
 
     /**
-     * Check if file is excluded.
-     */
-    private function is_file_excluded($file_path) {
-        // Use unified helper class for exclusion check
-        return Custom_Migrator_Helper::is_file_excluded($file_path);
-    }
-
-    /**
      * Get memory limit in bytes.
      */
     private function get_memory_limit_bytes() {
@@ -702,15 +797,6 @@ class Custom_Migrator_Exporter {
         }
         
         return $value;
-    }
-
-    /**
-     * Format bytes.
-     */
-    private function format_bytes($bytes) {
-        $units = ['B', 'K', 'M', 'G'];
-        $factor = floor((strlen($bytes) - 1) / 3);
-        return sprintf("%.2f%s", $bytes / pow(1024, $factor), $units[$factor]);
     }
 
     /**

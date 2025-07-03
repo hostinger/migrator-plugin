@@ -40,6 +40,11 @@ class Custom_Migrator_File_Enumerator {
         // Parse options with defaults
         $config = $this->parse_options($options);
         
+        // Apply unlimited execution environment if requested
+        if (!empty($config['use_unlimited_execution'])) {
+            $this->setup_unlimited_execution_environment();
+        }
+        
         $this->filesystem->log('Starting file enumeration with unified enumerator...');
         
         // Validate source directory
@@ -93,10 +98,40 @@ class Custom_Migrator_File_Enumerator {
             'use_exclusions' => true,
             'validate_files' => true,
             'skip_unreadable' => true,
-            'log_errors' => true
+            'log_errors' => true,
+            'use_unlimited_execution' => false  // Enable unlimited execution time for enumeration
         );
         
         return array_merge($defaults, $options);
+    }
+
+    /**
+     * Setup PHP environment for unlimited execution during enumeration
+     */
+    private function setup_unlimited_execution_environment() {
+        $this->filesystem->log('Applying unlimited execution environment for enumeration...');
+        
+        // Set whether a client disconnect should abort script execution
+        @ignore_user_abort(true);
+        
+        // Set maximum execution time - NO LIMIT during enumeration
+        @set_time_limit(0);
+        
+        // Set maximum time in seconds a script is allowed to parse input data
+        @ini_set('max_input_time', '-1');
+        
+        // Set maximum backtracking steps
+        @ini_set('pcre.backtrack_limit', PHP_INT_MAX);
+        
+        // Set binary safe encoding
+        if (@function_exists('mb_internal_encoding') && (@ini_get('mbstring.func_overload') & 2)) {
+            @mb_internal_encoding('ISO-8859-1');
+        }
+        
+        // Clean (erase) the output buffer and turn off output buffering
+        if (@ob_get_length()) {
+            @ob_end_clean();
+        }
     }
 
     /**
@@ -192,7 +227,7 @@ class Custom_Migrator_File_Enumerator {
             return $result;
         }
         
-        // Check exclusions first (pattern-based only)
+        // Check exclusions using optimized helper method
         if ($config['use_exclusions'] && Custom_Migrator_Helper::is_file_excluded($real_path)) {
             $result['excluded'] = true;
             return $result;
