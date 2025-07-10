@@ -292,6 +292,12 @@ class Custom_Migrator_Fallback_Exporter {
             }
         }
         
+        // Reset fallback export state (simplified - no partial files)
+        delete_option('cm_fallback_archive_offset');
+        delete_option('cm_fallback_content_offset');
+        
+        $this->filesystem->log("Reset fallback export state: archive_offset=0, content_offset=0");
+        
         // Update status
         $this->filesystem->write_status('fallback_initializing');
         
@@ -400,7 +406,22 @@ class Custom_Migrator_Fallback_Exporter {
      */
     private function fallback_create_archive($params) {
         $start_time = microtime(true);
-        $this->filesystem->log("Fallback export: Creating binary archive with chunked processing...");
+        $this->filesystem->log("Fallback export: Creating binary archive with time-based processing...");
+        
+        // CRITICAL: Check if export is already completed to prevent unnecessary processing
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+            if ($current_status === 'done') {
+                $this->filesystem->log("Export already completed (status: done), skipping archive creation step");
+                return array(
+                    'completed' => true,
+                    'next_step' => 'export_database',
+                    'message' => 'Export already completed',
+                    'params' => $params
+                );
+            }
+        }
         
         // Update status
         $this->filesystem->write_status('fallback_archiving');
@@ -416,113 +437,61 @@ class Custom_Migrator_Fallback_Exporter {
             throw new Exception('Content list file not found');
         }
         
-        // Get resume parameters - EXACTLY like regular export
+        // Get resume parameters (simplified - no partial files)
         $files_processed = isset($params['files_processed']) ? (int)$params['files_processed'] : 0;
         $bytes_processed = isset($params['bytes_processed']) ? (int)$params['bytes_processed'] : 0;
         $csv_offset = isset($params['csv_offset']) ? (int)$params['csv_offset'] : 0;
-        $archive_offset = isset($params['archive_offset']) ? (int)$params['archive_offset'] : 0;
         $total_files = isset($params['file_count']) ? (int)$params['file_count'] : $this->count_lines_in_csv($content_list_path);
         
-        // Log resume information for debugging
-        if ($files_processed > 0) {
-            $this->filesystem->log("Resuming archive creation: $files_processed files processed, CSV offset: $csv_offset, archive offset: $archive_offset");
+        // Use 10-second timeout for LVE-friendly processing
+        $timeout_seconds = apply_filters('custom_migrator_timeout', 10);
+        $this->filesystem->log("10-second batch processing: timeout={$timeout_seconds}s, resuming from file {$files_processed}");
+        
+        // Initialize archive file if starting fresh
+        if ($csv_offset === 0) {
+            $archive_handle = fopen($archive_path, 'wb');
+            if (!$archive_handle) {
+                throw new Exception('Cannot create archive file');
+            }
+            fclose($archive_handle);
         }
         
-        // Open content list first
-        $content_list = fopen($content_list_path, 'r');
-        if (!$content_list) {
-            throw new Exception('Cannot read content list file');
+        // Set up resume state (simplified - only 2 offsets)
+        $current_archive_offset = (int)get_option('cm_fallback_archive_offset', 0);
+        if ($csv_offset === 0) {
+            $current_archive_offset = 0;
         }
+        update_option('cm_fallback_archive_offset', $current_archive_offset);
+        update_option('cm_fallback_content_offset', $csv_offset);
         
-        // Seek to CSV offset if resuming - EXACTLY like regular export
-        if ($csv_offset > 0) {
-            fseek($content_list, $csv_offset);
-        }
-        
-        // Open archive file
-        $archive_mode = $archive_offset > 0 ? 'ab' : 'wb';
-        $archive_handle = fopen($archive_path, $archive_mode);
-        if (!$archive_handle) {
-            fclose($content_list);
-            throw new Exception('Cannot create archive file');
-        }
-        
-        // CRITICAL FIX: Don't seek when using append mode!
-        // Append mode ('ab') automatically positions at end of file
-        // The fseek() was causing corruption by seeking to wrong position
-        // if ($archive_offset > 0) {
-        //     fseek($archive_handle, $archive_offset);
-        // }
-        
-        $files_in_batch = 0;
-        $max_batch_size = apply_filters('custom_migrator_max_files_per_batch', 500);
-        $timeout_seconds = apply_filters('custom_migrator_timeout', 30);
         $completed = true;
+        $chunk_start_time = microtime(true);
         
-        // Process files in chunks with timeout protection
-        while (($file_data = fgetcsv($content_list, 0, ',', '"', '\\')) !== false) {
-            if (count($file_data) < 4) {
-                continue; // Skip malformed lines
-            }
-            
-            list($full_path, $relative_path, $size, $mtime) = $file_data;
-            
-            // Skip if file no longer exists
-            if (!file_exists($full_path) || !is_readable($full_path)) {
-                $this->filesystem->log("Warning: Skipping missing/unreadable file: " . basename($full_path));
-                continue;
-            }
-            
-            // Process the file using same binary format as main export
-            $file_info = [
-                'path' => $full_path,
-                'relative' => $relative_path,
-                'size' => (int)$size
-            ];
-            
-            $result = $this->fallback_add_file_to_archive_direct($archive_handle, $file_info);
-            
-            if ($result['success']) {
-                $files_processed++;
-                $bytes_processed += $result['bytes'];
-                $files_in_batch++;
-                
-                // Progress logging every 100 files
-                if ($files_processed % 100 === 0) {
-                    $progress = round(($files_processed / $total_files) * 100, 1);
-                    $this->filesystem->log("Batch progress: $files_processed/$total_files files ($progress%) processed");
-                }
-            } else {
-                $this->filesystem->log("Warning: Failed to process file: " . basename($full_path));
-            }
-            
-                    // Check timeout or batch size limits
+        // Use LVE-safe processing pattern
+        $result = $this->process_files_lve_safe($content_list_path, $archive_path, $chunk_start_time, $timeout_seconds);
+        
+        if (isset($result['error'])) {
+            throw new Exception($result['error']);
+        }
+        
+        $files_processed += $result['files_processed'];
+        $bytes_processed += $result['bytes_written'];
+        $completed = $result['is_complete'];
+        
+        // Update current positions for resume (simplified)
+        $current_csv_offset = $result['content_offset'];
+        
         $elapsed = microtime(true) - $start_time;
-        if ($elapsed > $timeout_seconds || $files_in_batch >= $max_batch_size) {
-            $completed = false;
-            break;
-        }
-    }
-    
-        // Check if we reached end of file
-    if (!$completed && feof($content_list)) {
-        $completed = true;
-    }
+        $progress = $total_files > 0 ? round(($files_processed / $total_files) * 100, 1) : 100;
         
-        // Get current positions for resume
-        $current_csv_offset = ftell($content_list);
-        // Archive offset is saved for logging but NOT used for seeking
-        // We use append mode ('ab') which automatically positions at end of file
-        $current_archive_offset = ftell($archive_handle);
-        
-            fclose($content_list);
-    fclose($archive_handle);
-    
-    $elapsed = microtime(true) - $start_time;
-    $progress = $total_files > 0 ? round(($files_processed / $total_files) * 100, 1) : 100;
-    
-    if ($completed) {
-            $this->filesystem->log("Archive completed: $files_processed files (" . $this->format_bytes($bytes_processed) . ") in " . round($elapsed, 1) . " seconds");
+        if ($completed) {
+            // Clean up resume options on successful completion
+            delete_option('cm_fallback_archive_offset');
+            delete_option('cm_fallback_content_offset');
+            
+            $this->filesystem->log("Archive completed: $files_processed files (" . 
+                                 $this->format_bytes($bytes_processed) . ") in " . 
+                                 round($elapsed, 1) . " seconds");
             
             return array(
                 'completed' => true,
@@ -537,12 +506,12 @@ class Custom_Migrator_Fallback_Exporter {
                 ))
             );
         } else {
-            $this->filesystem->log("Batch completed: $files_processed/$total_files files ($progress%)");
+            $this->filesystem->log("Batch completed: {$files_processed}/{$total_files} files ({$progress}%)");
             
             return array(
                 'completed' => false,
                 'next_step' => 'create_archive',
-                'message' => "Archiving in progress: $files_processed/$total_files files ($progress%)",
+                'message' => "Archiving in progress: {$files_processed}/{$total_files} files ({$progress}%)",
                 'files_processed' => $files_processed,
                 'bytes_processed' => $bytes_processed,
                 'pause_requested' => true,
@@ -550,126 +519,13 @@ class Custom_Migrator_Fallback_Exporter {
                     'files_processed' => $files_processed,
                     'bytes_processed' => $bytes_processed,
                     'csv_offset' => $current_csv_offset,
-                    'archive_offset' => $current_archive_offset,
                     'file_count' => $total_files
                 ))
             );
         }
     }
 
-    /**
-     * Add file to archive - Direct method using same binary format as main export
-     */
-    private function fallback_add_file_to_archive_direct($archive_handle, $file_info) {
-        $file_path = $file_info['path'];
-        $relative_path = $file_info['relative'];
-        $file_size = $file_info['size'];
-        
-        // Enhanced file validation
-        if (!file_exists($file_path) || !is_readable($file_path)) {
-            return ['success' => false, 'bytes' => 0];
-        }
-        
-        // ENHANCED: Large file handling and memory management
-        $is_large_file = $file_size > 50 * 1024 * 1024; // 50MB threshold
-        if ($is_large_file) {
-            $this->filesystem->log("Processing large file: " . basename($file_path) . " (" . $this->format_bytes($file_size) . ")");
-            
-            // Force garbage collection before large file
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
-            }
-        }
-        
-        // Get file stats
-        $stat = stat($file_path);
-        if ($stat === false) {
-            return ['success' => false, 'bytes' => 0];
-        }
-        
-        // Prepare file info for binary block - IDENTICAL to main export
-        $file_name = basename($file_path);
-        $file_date = $stat['mtime'];
-        $file_dir = dirname($relative_path);
-        
-        // Use unified binary block creation from helper
-        try {
-            $block = Custom_Migrator_Helper::create_binary_block($file_name, $file_size, $file_date, $file_dir);
-        } catch (Exception $e) {
-            return ['success' => false, 'bytes' => 0];
-        }
-        
-        $expected_size = Custom_Migrator_Helper::get_binary_block_size();
-        
-        // Write the header block
-        $header_written = fwrite($archive_handle, $block);
-        if ($header_written === false || $header_written !== $expected_size) {
-            return ['success' => false, 'bytes' => 0];
-        }
-        
-        // Open and copy file content
-        $file_handle = fopen($file_path, 'rb');
-        if (!$file_handle) {
-            return ['success' => false, 'bytes' => 0];
-        }
-        
-        $bytes_copied = 0;
-        $chunk_size = $is_large_file ? 256 * 1024 : 512000; // Smaller chunks for large files
-        
-        // ENHANCED: Progress tracking for large files
-        $progress_interval = $is_large_file ? (10 * 1024 * 1024) : 0; // 10MB intervals for large files
-        $last_progress = 0;
-        
-        while (!feof($file_handle)) {
-            $chunk = fread($file_handle, $chunk_size);
-            if ($chunk === false || strlen($chunk) === 0) {
-                break;
-            }
-            
-            $written = fwrite($archive_handle, $chunk);
-            if ($written === false || $written !== strlen($chunk)) {
-                fclose($file_handle);
-                return ['success' => false, 'bytes' => $bytes_copied];
-            }
-            
-            $bytes_copied += $written;
-            
-            // ENHANCED: Progress logging and memory management for large files
-            if ($is_large_file && $progress_interval > 0 && ($bytes_copied - $last_progress) >= $progress_interval) {
-                $progress = round(($bytes_copied / $file_size) * 100, 1);
-                $this->filesystem->log("Large file progress: {$progress}% of " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . "/" . $this->format_bytes($file_size) . ")");
-                $last_progress = $bytes_copied;
-                
-                // Force garbage collection during large file processing
-                if (function_exists('gc_collect_cycles')) {
-                    gc_collect_cycles();
-                }
-            }
-        }
-        
-        fclose($file_handle);
-        
-        // ENHANCED: Post-large-file memory management
-        if ($is_large_file) {
-            $this->filesystem->log("Large file completed: " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . ")");
-            
-            // Force garbage collection after large file
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
-            }
-            
-            // Flush archive buffer to disk to free memory
-            if (function_exists('fflush')) {
-                fflush($archive_handle);
-            }
-            
-            // Brief pause to let system recover
-            usleep(100000); // 0.1 second pause
-        }
-        
-        // Return total bytes written (header + file content)
-        return ['success' => true, 'bytes' => $expected_size + $bytes_copied];
-    }
+
 
     /**
      * Export database (Step 4) - Chunked processing with timeout protection
@@ -677,6 +533,21 @@ class Custom_Migrator_Fallback_Exporter {
     private function fallback_export_database($params) {
         $start_time = microtime(true);
         $this->filesystem->log("Fallback export: Creating database export with unified database exporter...");
+        
+        // CRITICAL: Check if export is already completed to prevent unnecessary processing
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+            if ($current_status === 'done') {
+                $this->filesystem->log("Export already completed (status: done), skipping database export step");
+                return array(
+                    'completed' => true,
+                    'next_step' => 'create_metadata',
+                    'message' => 'Export already completed',
+                    'params' => $params
+                );
+            }
+        }
         
         // DEBUG: Log the parameters being received
         $this->filesystem->log("Database export params received: " . json_encode($params));
@@ -725,6 +596,7 @@ class Custom_Migrator_Fallback_Exporter {
                     'total_tables' => isset($params['total_tables']) ? (int)$params['total_tables'] : 0,
                     'rows_exported' => isset($params['rows_exported']) ? (int)$params['rows_exported'] : 0,
                     'bytes_written' => isset($params['bytes_written']) ? (int)$params['bytes_written'] : 0,
+                    'temp_file_path' => isset($params['temp_file_path']) ? $params['temp_file_path'] : null,
                 );
                 $this->filesystem->log("Database export will resume with state: " . json_encode($resume_state));
             } else {
@@ -777,7 +649,8 @@ class Custom_Migrator_Fallback_Exporter {
                         'table_offset' => isset($result['state']['table_offset']) ? $result['state']['table_offset'] : 0,
                         'total_tables' => $result['total_tables'],
                         'rows_exported' => $result['rows_exported'],
-                        'bytes_written' => $result['bytes_written']
+                        'bytes_written' => $result['bytes_written'],
+                        'temp_file_path' => isset($result['state']['temp_file_path']) ? $result['state']['temp_file_path'] : null
                     ))
                 );
             }
@@ -801,6 +674,21 @@ class Custom_Migrator_Fallback_Exporter {
     private function fallback_create_metadata($params) {
         $start_time = microtime(true);
         $this->filesystem->log("Fallback export: Creating metadata using unified metadata generator...");
+        
+        // CRITICAL: Check if export is already completed to prevent unnecessary processing
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+            if ($current_status === 'done') {
+                $this->filesystem->log("Export already completed (status: done), skipping metadata creation step");
+                return array(
+                    'completed' => true,
+                    'next_step' => 'finalize',
+                    'message' => 'Export already completed',
+                    'params' => $params
+                );
+            }
+        }
         
         // Update status
         $this->filesystem->write_status('fallback_metadata');
@@ -858,6 +746,22 @@ class Custom_Migrator_Fallback_Exporter {
      */
     private function fallback_finalize($params) {
         $this->filesystem->log("Fallback export: Finalizing with 99% completion validation...");
+        
+        // CRITICAL: Check if export is already completed to prevent infinite loops
+        $status_file = $this->filesystem->get_status_file_path();
+        if (file_exists($status_file)) {
+            $current_status = trim(file_get_contents($status_file));
+            if ($current_status === 'done') {
+                $this->filesystem->log("Export already completed (status: done), skipping finalize step");
+                return array(
+                    'completed' => true,
+                    'next_step' => null,
+                    'message' => 'Export already completed!',
+                    'final' => true,
+                    'params' => $params
+                );
+            }
+        }
         
         // Update status
         $this->filesystem->write_status('fallback_finalizing');
@@ -920,6 +824,9 @@ class Custom_Migrator_Fallback_Exporter {
         // Update final status
         $this->filesystem->write_status('done');
         
+        // Clear performance data on successful export to prevent sticking in "slow" mode
+        $this->clear_performance_data_on_success();
+        
         $this->filesystem->log("Fallback export completed successfully with validation!");
         
         return array(
@@ -935,16 +842,27 @@ class Custom_Migrator_Fallback_Exporter {
      * Check if database export is already completed
      */
     private function is_database_export_complete($sql_file) {
+        // CRITICAL FIX: Handle both .sql and .sql.gz extensions properly
+        
+        // If sql_file already has .gz extension, check for that file directly
+        if (substr($sql_file, -3) === '.gz') {
+            $compressed_file = $sql_file;
+            $uncompressed_file = substr($sql_file, 0, -3); // Remove .gz
+        } else {
+            $compressed_file = $sql_file . '.gz';
+            $uncompressed_file = $sql_file;
+        }
+        
         // Method 1: Check if the compressed file exists and has content
-        if (file_exists($sql_file . '.gz') && filesize($sql_file . '.gz') > 1024) {
-            $this->filesystem->log('Database export found (compressed): ' . basename($sql_file . '.gz') . ' (' . $this->format_bytes(filesize($sql_file . '.gz')) . ')');
+        if (file_exists($compressed_file) && filesize($compressed_file) > 1024) {
+            $this->filesystem->log('Database export found (compressed): ' . basename($compressed_file) . ' (' . $this->format_bytes(filesize($compressed_file)) . ')');
             return true;
         }
         
         // Method 2: Check if the uncompressed file exists and is complete
-        if (file_exists($sql_file) && filesize($sql_file) > 1024) {
+        if (file_exists($uncompressed_file) && filesize($uncompressed_file) > 1024) {
             // Read last 1024 bytes to check for completion marker
-            $handle = fopen($sql_file, 'r');
+            $handle = fopen($uncompressed_file, 'r');
             if ($handle) {
                 fseek($handle, -1024, SEEK_END);
                 $tail = fread($handle, 1024);
@@ -954,7 +872,7 @@ class Custom_Migrator_Fallback_Exporter {
                 if (strpos($tail, '-- Export completed') !== false || 
                     strpos($tail, 'COMMIT;') !== false ||
                     strpos($tail, '/*!40101 SET') !== false) {
-                    $this->filesystem->log('Database export found (uncompressed): ' . basename($sql_file) . ' (' . $this->format_bytes(filesize($sql_file)) . ')');
+                    $this->filesystem->log('Database export found (uncompressed): ' . basename($uncompressed_file) . ' (' . $this->format_bytes(filesize($uncompressed_file)) . ')');
                     return true;
                 }
             }
@@ -962,5 +880,374 @@ class Custom_Migrator_Fallback_Exporter {
         
         $this->filesystem->log('No completed database export found');
         return false;
+    }
+    
+    /**
+     * DEPRECATED: Adaptive batch sizing methods removed.
+     * Now using time-based processing (10-second timeout) like regular export method.
+     */
+
+    /**
+     * Process files using optimized 10-second time-based approach (complete files only)
+     */
+    private function process_files_lve_safe($csv_file, $archive_file, $start_time, $timeout_seconds) {
+        // Simplified state management - only 2 offsets needed (no partial files)
+        $archive_bytes_offset = (int)get_option('cm_fallback_archive_offset', 0);
+        $content_bytes_offset = (int)get_option('cm_fallback_content_offset', 0);
+        
+        $files_processed = 0;
+        $processed_files_size = 0;
+        $completed = true;
+        
+        // Open CSV file and seek to position
+        $content_list = fopen($csv_file, 'r');
+        if (!$content_list) {
+            return array('error' => 'Cannot open CSV file for reading');
+        }
+        
+        if (fseek($content_list, $content_bytes_offset) !== 0) {
+            fclose($content_list);
+            return array('error' => 'Cannot seek to CSV position');
+        }
+        
+        // Open archive file (create if doesn't exist)
+        $archive_handle = fopen($archive_file, file_exists($archive_file) ? 'r+b' : 'w+b');
+        if (!$archive_handle) {
+            fclose($content_list);
+            return array('error' => 'Cannot open archive file');
+        }
+        
+        if (fseek($archive_handle, $archive_bytes_offset) !== 0) {
+            fclose($content_list);
+            fclose($archive_handle);
+            return array('error' => 'Cannot seek to archive position');
+        }
+        
+        $this->filesystem->log("Starting batch: archive_offset=$archive_bytes_offset, content_offset=$content_bytes_offset");
+        
+        // Process files with 10-second timeout (complete files only)
+        while (($csv_data = fgetcsv($content_list)) !== false) {
+            if (count($csv_data) < 4) continue;
+            
+            list($file_abspath, $file_relpath, $file_size, $file_mtime) = $csv_data;
+            $file_size = (int)$file_size;
+            $file_mtime = (int)$file_mtime;
+            
+            // Validate file data
+            if (empty($file_abspath) || $file_size < 0 || $file_mtime <= 0) {
+                $content_bytes_offset = ftell($content_list);
+                continue;
+            }
+            
+            // Check if file exists and is readable
+            if (!file_exists($file_abspath) || !is_readable($file_abspath)) {
+                $content_bytes_offset = ftell($content_list);
+                $this->filesystem->log("Skipping unreadable file: " . basename($file_abspath));
+                continue;
+            }
+            
+            // Check timeout before starting next file (but let current file complete)
+            if ((microtime(true) - $start_time) > $timeout_seconds && $files_processed > 0) {
+                $completed = false;
+                $this->filesystem->log("Timeout reached after $files_processed files");
+                break;
+            }
+            
+            // Process complete file only (no partial processing)
+            $file_bytes_written = 0;
+            $file_completed = $this->add_complete_file_to_archive(
+                $archive_handle, 
+                $file_abspath, 
+                $file_relpath, 
+                $file_size, 
+                $file_mtime, 
+                $file_bytes_written
+            );
+            
+            if ($file_completed) {
+                // File completed successfully
+                $files_processed++;
+                $processed_files_size += $file_bytes_written;
+                $content_bytes_offset = ftell($content_list);
+                $archive_bytes_offset = ftell($archive_handle);
+                
+                // Log progress every 50 files
+                if ($files_processed % 50 === 0) {
+                    $elapsed = round(microtime(true) - $start_time, 1);
+                    $this->filesystem->log("Progress: $files_processed files in {$elapsed}s (" . 
+                                         $this->format_bytes($processed_files_size) . ")");
+                }
+            } else {
+                // File failed - log and continue to next file
+                $this->filesystem->log("ERROR: Failed to process " . basename($file_abspath));
+                $content_bytes_offset = ftell($content_list);
+                continue;
+            }
+        }
+        
+        fclose($content_list);
+        fclose($archive_handle);
+        
+        // Save state for next batch (simplified - only 2 offsets)
+        update_option('cm_fallback_archive_offset', $archive_bytes_offset);
+        update_option('cm_fallback_content_offset', $content_bytes_offset);
+        
+        // Check if we've processed all files
+        if ($completed) {
+            $content_list = fopen($csv_file, 'r');
+            fseek($content_list, $content_bytes_offset);
+            $is_complete = (fgetcsv($content_list) === false);
+            fclose($content_list);
+        } else {
+            $is_complete = false;
+        }
+        
+        $elapsed = round(microtime(true) - $start_time, 1);
+        $this->filesystem->log("Batch completed: $files_processed files in {$elapsed}s");
+        
+        return array(
+            'files_processed' => $files_processed,
+            'bytes_written' => $processed_files_size,
+            'is_complete' => $is_complete,
+            'archive_offset' => $archive_bytes_offset,
+            'content_offset' => $content_bytes_offset
+        );
+    }
+    
+    /**
+     * Add complete file to archive (no partial processing) - LVE optimized
+     */
+    private function add_complete_file_to_archive($archive_handle, $file_path, $file_relpath, $file_size, $file_mtime, &$bytes_written) {
+        $bytes_written = 0;
+        
+        try {
+            // Create binary header using CSV data for consistency
+            $filename = basename($file_path);
+            $file_dir = dirname($file_relpath);
+            
+            // CRITICAL FIX: Ensure file_size and file_mtime are integers, not strings from CSV
+            $file_size = (int)$file_size;
+            $file_mtime = (int)$file_mtime;
+            
+            // Validate the data before creating binary block
+            if ($file_size < 0) {
+                $this->filesystem->log("ERROR: Invalid file size for " . basename($file_path) . ": $file_size");
+                return false;
+            }
+            
+            if ($file_mtime <= 0) {
+                $this->filesystem->log("ERROR: Invalid modification time for " . basename($file_path) . ": $file_mtime");
+                return false;
+            }
+            
+            // CRITICAL FIX: Try to open the file FIRST before writing any headers
+            $file_handle = fopen($file_path, 'rb');
+            if (!$file_handle) {
+                $this->filesystem->log("ERROR: Cannot open file for reading: " . basename($file_path));
+                return false;
+            }
+            
+            $block = Custom_Migrator_Helper::create_binary_block($filename, $file_size, $file_mtime, $file_dir);
+            
+            // Write header
+            if (fwrite($archive_handle, $block) === false) {
+                fclose($file_handle);
+                return false;
+            }
+            
+            // Copy file content in 256KB chunks (LVE-friendly I/O)
+            $chunk_size = 256 * 1024; // 256KB chunks for optimal LVE performance
+            while (!feof($file_handle)) {
+                $chunk = fread($file_handle, $chunk_size);
+                if ($chunk === false || fwrite($archive_handle, $chunk) === false) {
+                    fclose($file_handle);
+                    return false;
+                }
+                $bytes_written += strlen($chunk);
+            }
+            
+            fclose($file_handle);
+            return true;
+            
+        } catch (Exception $e) {
+            $this->filesystem->log("ERROR adding file: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * DEPRECATED: Old partial file processing method - replaced with complete file processing
+     * Add file to archive with proper partial file processing
+     * UPDATED: Now uses All-in-One WP Migration's exact approach to prevent corruption
+     */
+    private function add_file_binary_format($archive_handle, $file_name, $file_relpath, &$file_written, &$file_offset, $start_time, $timeout_seconds, $file_mtime = null, $csv_file_size = null) {
+        $file_written = 0;
+        
+        // Get file info - use CSV data for consistency
+        $stat = stat($file_name);
+        if ($stat === false) {
+            $this->filesystem->log("ERROR: Cannot stat file: " . basename($file_name));
+            return false;
+        }
+        
+        // CRITICAL FIX: Use CSV file size instead of stat() to prevent corruption
+        $file_size = $csv_file_size !== null ? $csv_file_size : $stat['size'];
+        
+        // Log file size comparison for debugging
+        if ($csv_file_size !== null && $csv_file_size !== $stat['size']) {
+            $this->filesystem->log("WARNING: File size mismatch for " . basename($file_name) . " - CSV: $csv_file_size, STAT: {$stat['size']}");
+        }
+        
+        // CRITICAL FIX: Use modification time from CSV file instead of stat() to prevent corruption
+        $file_date = $file_mtime !== null ? $file_mtime : $stat['mtime'];
+        
+        // Validate modification time
+        if ($file_date <= 0) {
+            $this->filesystem->log("ERROR: Invalid modification time for file: " . basename($file_name) . " (mtime: $file_date)");
+            return false;
+        }
+        
+        // Open the file for reading
+        $file_handle = fopen($file_name, 'rb');
+        if (!$file_handle) {
+            $this->filesystem->log("ERROR: Cannot open file for reading: " . basename($file_name));
+            return false;
+        }
+        
+        $filename = basename($file_name);
+        $file_dir = dirname($file_relpath);
+        $completed = true;
+        
+        try {
+            // Write full header with real file size immediately
+            if ($file_offset === 0) {
+                // CRITICAL VALIDATION: Ensure all header data is valid before creating binary block
+                if (empty($filename) || strlen($filename) > 255) {
+                    $this->filesystem->log("ERROR: Invalid filename for binary block: " . basename($file_name));
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                if ($file_size < 0 || $file_size > PHP_INT_MAX) {
+                    $this->filesystem->log("ERROR: Invalid file size for binary block: " . basename($file_name) . " (size: $file_size)");
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                // Create binary block
+                $block = Custom_Migrator_Helper::create_binary_block($filename, $file_size, $file_date, $file_dir);
+                $expected_size = Custom_Migrator_Helper::get_binary_block_format()['size'];
+                
+                // CRITICAL VALIDATION: Ensure block was created properly
+                if (strlen($block) !== $expected_size) {
+                    $this->filesystem->log("ERROR: Binary block size mismatch for: " . basename($file_name) . " (expected: $expected_size, got: " . strlen($block) . ")");
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                // Write the full header block and flush immediately
+                $header_bytes = fwrite($archive_handle, $block);
+                if ($header_bytes === false || $header_bytes !== $expected_size) {
+                    $this->filesystem->log("ERROR: Failed to write header for: " . basename($file_name));
+                    fclose($file_handle);
+                    return false;
+                }
+                fflush($archive_handle);  // Force flush after header
+            }
+            
+            // Seek to the resume position in source file
+            if (fseek($file_handle, $file_offset, SEEK_SET) !== 0) {
+                $this->filesystem->log("ERROR: Failed to seek to offset $file_offset in: " . basename($file_name));
+                fclose($file_handle);
+                return false;
+            }
+            
+            // Get current archive position (main loop handles positioning)
+            $archive_pos = ftell($archive_handle);
+            if ($archive_pos === false) {
+                $this->filesystem->log("ERROR: Cannot get archive position for: " . basename($file_name));
+                fclose($file_handle);
+                return false;
+            }
+            
+            // Read and write file content in chunks with bounds checking
+            $chunks_processed = 0;
+            $total_bytes_to_write = $file_size - $file_offset;  // Remaining bytes to write
+            $bytes_written_this_session = 0;
+            
+            while (!feof($file_handle) && $bytes_written_this_session < $total_bytes_to_write) {
+                // Check timeout BEFORE reading chunk
+                $elapsed = microtime(true) - $start_time;
+                if ($elapsed > $timeout_seconds) {
+                    $completed = false;
+                    break;
+                }
+                
+                // Calculate chunk size - don't read more than what's left in the file
+                $remaining_bytes = $total_bytes_to_write - $bytes_written_this_session;
+                $chunk_size = min(512000, $remaining_bytes);
+                
+                if ($chunk_size <= 0) {
+                    break;  // No more bytes to write
+                }
+                
+                // Read chunk
+                $file_content = fread($file_handle, $chunk_size);
+                if ($file_content === false) {
+                    $this->filesystem->log("ERROR: Failed to read chunk from: " . basename($file_name));
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                $chunk_length = strlen($file_content);
+                if ($chunk_length === 0) {
+                    break;  // End of file
+                }
+                
+                // CRITICAL SAFETY CHECK: Ensure we don't exceed file boundaries
+                if ($bytes_written_this_session + $chunk_length > $total_bytes_to_write) {
+                    $allowed_bytes = $total_bytes_to_write - $bytes_written_this_session;
+                    $file_content = substr($file_content, 0, $allowed_bytes);
+                    $chunk_length = strlen($file_content);
+                    $this->filesystem->log("WARNING: Truncated chunk for: " . basename($file_name) . " to prevent overflow");
+                }
+                
+                // Verify archive position before write
+                $current_pos = ftell($archive_handle);
+                if ($current_pos !== $archive_pos) {
+                    $this->filesystem->log("ERROR: Archive position mismatch for: " . basename($file_name) . " - expected: $archive_pos, actual: $current_pos");
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                // Write chunk to archive
+                $file_bytes = fwrite($archive_handle, $file_content);
+                if ($file_bytes === false || $file_bytes !== $chunk_length) {
+                    $this->filesystem->log("ERROR: Failed to write chunk for: " . basename($file_name) . " - wrote: $file_bytes, expected: $chunk_length");
+                    fclose($file_handle);
+                    return false;
+                }
+                
+                // Update positions and flush
+                $file_written += $file_bytes;
+                $file_offset += $file_bytes;
+                $archive_pos += $file_bytes;
+                $bytes_written_this_session += $file_bytes;
+                fflush($archive_handle);  // Force flush after each chunk
+                
+                $chunks_processed++;
+                
+                // Final safety check - ensure we don't exceed file size
+                if ($file_written > $file_size) {
+                    $this->filesystem->log("CRITICAL ERROR: File overflow detected for: " . basename($file_name) . " - written: $file_written, max: $file_size");
+                    fclose($file_handle);
+                    return false;
+                }
+            }
+        } finally {
+            fclose($file_handle);
+        }
+        
+        return $completed;
     }
 } 
