@@ -491,6 +491,7 @@ class Custom_Migrator_Exporter {
 
     /**
      * Add a file to the binary archive using the structured format.
+     * UPDATED: Now uses All-in-One WP Migration's exact approach to prevent corruption.
      */
     private function add_file_to_archive($archive_handle, $file_info) {
         $file_path = $file_info['path'];
@@ -499,90 +500,86 @@ class Custom_Migrator_Exporter {
         
         // Enhanced file validation
         if (!file_exists($file_path)) {
-            $this->filesystem->log("File disappeared during processing: " . basename($file_path));
+            $this->filesystem->log("ERROR: File disappeared during processing: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
         }
         
         if (!is_readable($file_path)) {
-            $this->filesystem->log("File became unreadable: " . basename($file_path));
+            $this->filesystem->log("ERROR: File became unreadable: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
         }
         
         // Re-check file size (files can change during processing)
         $current_size = filesize($file_path);
         if ($current_size !== $file_size) {
-            $this->filesystem->log("File size changed during processing: " . basename($file_path) . " (was: $file_size, now: $current_size) - using current size");
+            $this->filesystem->log("WARNING: File size changed during processing: " . basename($file_path) . " (was: $file_size, now: $current_size)");
             $file_size = $current_size;
             $file_info['size'] = $file_size; // Update for consistency
-        }
-        
-        // ENHANCED: Large file handling and memory management
-        $is_large_file = $file_size > 50 * 1024 * 1024; // 50MB threshold
-        if ($is_large_file) {
-            $this->filesystem->log("Processing large file: " . basename($file_path) . " (" . $this->format_bytes($file_size) . ")");
-            
-            // Force garbage collection before large file
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
-            }
-            
-            // Check available memory
-            $memory_limit = $this->get_memory_limit();
-            $memory_used = memory_get_usage(true);
-            $memory_available = $memory_limit - $memory_used;
-            
-            if ($memory_available < ($file_size * 1.5)) {
-                $this->filesystem->log("Warning: Low memory for large file processing. Available: " . $this->format_bytes($memory_available) . ", File: " . $this->format_bytes($file_size));
-            }
         }
         
         // Get file stats
         $stat = stat($file_path);
         if ($stat === false) {
-            $this->filesystem->log("Cannot get file stats: " . basename($file_path));
+            $this->filesystem->log("ERROR: Cannot get file stats: " . basename($file_path));
             return ['success' => false, 'bytes' => 0];
         }
         
-        // Prepare file info for binary block - ensure strings fit in allocated space
+        // CRITICAL FIX: Try to open the file FIRST before writing any headers
+        $file_handle = fopen($file_path, 'rb');
+        if (!$file_handle) {
+            $this->filesystem->log("ERROR: Cannot open file for reading: " . basename($file_path));
+            return ['success' => false, 'bytes' => 0];
+        }
+        
+        // Prepare file info for binary block
         $file_name = basename($file_path);
         $file_date = $stat['mtime'];
         $file_dir = dirname($relative_path);
         
-        // Use unified binary block creation from helper
+        // CRITICAL FIX: Ensure file_size and file_date are integers
+        $file_size = (int)$file_size;
+        $file_date = (int)$file_date;
+        
+        // Validate the data before creating binary block
+        if ($file_size < 0) {
+            $this->filesystem->log("ERROR: Invalid file size for " . basename($file_path) . ": $file_size");
+            fclose($file_handle);
+            return ['success' => false, 'bytes' => 0];
+        }
+        
+        if ($file_date <= 0) {
+            $this->filesystem->log("ERROR: Invalid modification time for " . basename($file_path) . ": $file_date");
+            fclose($file_handle);
+            return ['success' => false, 'bytes' => 0];
+        }
+        
+        // Write full header with real file size immediately (All-in-One's approach)
         try {
             $block = Custom_Migrator_Helper::create_binary_block($file_name, $file_size, $file_date, $file_dir);
         } catch (Exception $e) {
-            $this->filesystem->log("Error: " . $e->getMessage());
+            $this->filesystem->log("ERROR: " . $e->getMessage());
+            fclose($file_handle);
             return ['success' => false, 'bytes' => 0];
         }
         
         $expected_size = Custom_Migrator_Helper::get_binary_block_size();
         
-        // Write the header block with verification
+        // Write the full header block
         $header_written = fwrite($archive_handle, $block);
         if ($header_written === false || $header_written !== $expected_size) {
-            $this->filesystem->log("Error: Failed to write header block for {$file_name}");
+            $this->filesystem->log("ERROR: Failed to write header block for {$file_name}");
+            fclose($file_handle);
             return ['success' => false, 'bytes' => 0];
         }
         
-        // ENHANCED: Large file content copying with memory management
-        $file_handle = fopen($file_path, 'rb');
-        if (!$file_handle) {
-            $this->filesystem->log("Error: Cannot open file for reading: " . basename($file_path));
-            return ['success' => false, 'bytes' => 0];
-        }
-        
+        // Copy file content
         $bytes_copied = 0;
-        $chunk_size = $is_large_file ? 256 * 1024 : self::CHUNK_SIZE; // Smaller chunks for large files
-        
-        // ENHANCED: Progress tracking for large files
-        $progress_interval = $is_large_file ? (10 * 1024 * 1024) : 0; // 10MB intervals for large files
-        $last_progress = 0;
+        $chunk_size = 256 * 1024; // 256KB chunks
         
         while (!feof($file_handle)) {
             $chunk = fread($file_handle, $chunk_size);
             if ($chunk === false) {
-                $this->filesystem->log("Error: Failed to read from file: " . basename($file_path));
+                $this->filesystem->log("ERROR: Failed to read from file: " . basename($file_path));
                 fclose($file_handle);
                 return ['success' => false, 'bytes' => $bytes_copied];
             }
@@ -594,49 +591,21 @@ class Custom_Migrator_Exporter {
             
             $written = fwrite($archive_handle, $chunk);
             if ($written === false || $written !== $chunk_length) {
-                $this->filesystem->log("Error: Failed to write chunk for file: " . basename($file_path));
+                $this->filesystem->log("ERROR: Failed to write chunk for file: " . basename($file_path));
                 fclose($file_handle);
                 return ['success' => false, 'bytes' => $bytes_copied];
             }
             
             $bytes_copied += $written;
-            
-            // ENHANCED: Progress logging and memory management for large files
-            if ($is_large_file && $progress_interval > 0 && ($bytes_copied - $last_progress) >= $progress_interval) {
-                $progress = round(($bytes_copied / $file_size) * 100, 1);
-                $this->filesystem->log("Large file progress: {$progress}% of " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . "/" . $this->format_bytes($file_size) . ")");
-                $last_progress = $bytes_copied;
-                
-                // Force garbage collection during large file processing
-                if (function_exists('gc_collect_cycles')) {
-                    gc_collect_cycles();
-                }
-            }
         }
         
         fclose($file_handle);
         
-        // ENHANCED: Post-large-file memory management
-        if ($is_large_file) {
-            $this->filesystem->log("Large file completed: " . basename($file_path) . " (" . $this->format_bytes($bytes_copied) . ")");
-            
-            // Force garbage collection after large file
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
-            }
-            
-            // Flush archive buffer to disk to free memory
-            if (function_exists('fflush')) {
-                fflush($archive_handle);
-            }
-            
-            // Brief pause to let system recover
-            usleep(100000); // 0.1 second pause
-        }
+        // REMOVED: Size update logic (was causing potential corruption)
         
         // Final verification - ensure we copied the expected amount
         if ($bytes_copied !== $file_size) {
-            $this->filesystem->log("Warning: Bytes copied ($bytes_copied) doesn't match file size ($file_size) for: " . basename($file_path));
+            $this->filesystem->log("WARNING: Bytes copied ($bytes_copied) doesn't match file size ($file_size) for: " . basename($file_path));
         }
         
         return ['success' => true, 'bytes' => $bytes_copied];
@@ -966,16 +935,27 @@ class Custom_Migrator_Exporter {
     private function is_database_export_complete($sql_file) {
         // Only check the EXACT current database file, not old ones from previous exports
         
+        // CRITICAL FIX: Handle both .sql and .sql.gz extensions properly
+        
+        // If sql_file already has .gz extension, check for that file directly
+        if (substr($sql_file, -3) === '.gz') {
+            $compressed_file = $sql_file;
+            $uncompressed_file = substr($sql_file, 0, -3); // Remove .gz
+        } else {
+            $compressed_file = $sql_file . '.gz';
+            $uncompressed_file = $sql_file;
+        }
+        
         // Method 1: Check if the exact compressed file exists and has content
-        if (file_exists($sql_file . '.gz') && filesize($sql_file . '.gz') > 1024) {
-            $this->filesystem->log('Current database export found: ' . basename($sql_file . '.gz') . ' (' . $this->format_bytes(filesize($sql_file . '.gz')) . ')');
+        if (file_exists($compressed_file) && filesize($compressed_file) > 1024) {
+            $this->filesystem->log('Current database export found: ' . basename($compressed_file) . ' (' . $this->format_bytes(filesize($compressed_file)) . ')');
             return true;
         }
         
         // Method 2: Check if the exact uncompressed file exists and is complete
-        if (file_exists($sql_file) && filesize($sql_file) > 1024) {
+        if (file_exists($uncompressed_file) && filesize($uncompressed_file) > 1024) {
             // Read last 1024 bytes to check for completion marker
-            $handle = fopen($sql_file, 'r');
+            $handle = fopen($uncompressed_file, 'r');
             if ($handle) {
                 fseek($handle, -1024, SEEK_END);
                 $tail = fread($handle, 1024);
@@ -985,7 +965,7 @@ class Custom_Migrator_Exporter {
                 if (strpos($tail, '-- Export completed') !== false || 
                     strpos($tail, 'COMMIT;') !== false ||
                     strpos($tail, '/*!40101 SET') !== false) {
-                    $this->filesystem->log('Current database export found: ' . basename($sql_file) . ' (' . $this->format_bytes(filesize($sql_file)) . ')');
+                    $this->filesystem->log('Current database export found: ' . basename($uncompressed_file) . ' (' . $this->format_bytes(filesize($uncompressed_file)) . ')');
                     return true;
                 }
             }
@@ -1005,42 +985,69 @@ class Custom_Migrator_Exporter {
         
         // Check if another process is already exporting database
         if (file_exists($lock_file)) {
-            $lock_time = filemtime($lock_file);
+            $lock_content = file_get_contents($lock_file);
+            $lock_data = json_decode($lock_content, true);
             $current_time = time();
             
-            // If lock is older than 5 minutes, consider it stale
-            if (($current_time - $lock_time) > 300) {
-                $this->filesystem->log('Removing stale database export lock (older than 5 minutes)');
-                @unlink($lock_file);
-                @unlink($status_file);
-            } else {
-                // Check if database export is actually running
-                if (file_exists($status_file)) {
-                    $status = json_decode(file_get_contents($status_file), true);
-                    $progress_time = isset($status['last_update']) ? $status['last_update'] : 0;
-                    
-                    // If no progress in last 2 minutes, consider it stuck
-                    if (($current_time - $progress_time) > 120) {
-                        $this->filesystem->log('Database export appears stuck, removing lock');
-                        @unlink($lock_file);
-                        @unlink($status_file);
+            if ($lock_data) {
+                $lock_time = $lock_data['timestamp'];
+                $lock_pid = isset($lock_data['pid']) ? $lock_data['pid'] : null;
+                $current_pid = function_exists('getmypid') ? getmypid() : null;
+                
+                // If this is the same process, continue (resume case)
+                if ($lock_pid && $current_pid && $lock_pid == $current_pid) {
+                    $this->filesystem->log('Database export lock belongs to current process, continuing');
+                } 
+                // PRODUCTION-SAFE: Very conservative lock timeouts for high-volume production (3000 sites/week)
+                // If lock is older than 20 minutes, consider it definitely stale
+                else if (($current_time - $lock_time) > 1200) {
+                    $this->filesystem->log('Removing very stale database export lock (older than 20 minutes)');
+                    @unlink($lock_file);
+                    @unlink($status_file);
+                }
+                // If lock is 10-20 minutes old, check status more carefully
+                else if (($current_time - $lock_time) > 600) {
+                    if (file_exists($status_file)) {
+                        $status = json_decode(file_get_contents($status_file), true);
+                        $progress_time = isset($status['last_update']) ? $status['last_update'] : $lock_time;
+                        
+                        // If no progress in last 10 minutes, consider it stuck
+                        if (($current_time - $progress_time) > 600) {
+                            $this->filesystem->log('Database export appears stuck (no progress for 10+ minutes), removing lock');
+                            @unlink($lock_file);
+                            @unlink($status_file);
+                        } else {
+                            $this->filesystem->log('Database export in progress by another process (active within 10 minutes), skipping');
+                            return;
+                        }
                     } else {
-                        $this->filesystem->log('Database export already in progress by another process, waiting...');
-                        return;
+                        $this->filesystem->log('Database export lock exists but no status file, removing stale lock');
+                        @unlink($lock_file);
                     }
                 } else {
-                    $this->filesystem->log('Database export lock exists but no status file, removing lock');
-                    @unlink($lock_file);
+                    // Lock is recent (less than 10 minutes old)
+                    $this->filesystem->log('Recent database export lock detected, skipping to avoid conflicts');
+                    return;
                 }
+            } else {
+                // Invalid lock file format
+                $this->filesystem->log('Invalid database export lock file format, removing');
+                @unlink($lock_file);
+                @unlink($status_file);
             }
         }
         
-        // Create lock file to claim database export
-        file_put_contents($lock_file, time());
+        // Create improved lock file with process info
+        $lock_data = [
+            'timestamp' => time(),
+            'pid' => function_exists('getmypid') ? getmypid() : mt_rand(10000, 99999),
+            'started' => time()
+        ];
+        file_put_contents($lock_file, json_encode($lock_data));
         file_put_contents($status_file, json_encode([
             'started' => time(),
             'last_update' => time(),
-            'pid' => getmypid()
+            'pid' => $lock_data['pid']
         ]));
         
         try {

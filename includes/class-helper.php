@@ -114,6 +114,17 @@ class Custom_Migrator_Helper {
     public static function is_file_excluded($file_path) {
         $compiled = self::get_compiled_exclusions();
         
+        // Fast specific file matching (exact paths)
+        foreach ($compiled['specific_files'] as $specific_file) {
+            if ($file_path === $specific_file || basename($file_path) === basename($specific_file)) {
+                return true;
+            }
+            // Also check if the file path ends with the specific file path
+            if (substr($file_path, -strlen($specific_file)) === $specific_file) {
+                return true;
+            }
+        }
+        
         // Fast directory prefix matching (most common case)
         foreach ($compiled['directory_prefixes'] as $prefix) {
             if (strpos($file_path, $prefix) === 0) {
@@ -183,14 +194,27 @@ class Custom_Migrator_Helper {
     private static function compile_exclusion_patterns() {
         $exclusion_paths = self::get_exclusion_paths();
         
-        // Create directory prefixes with trailing slashes
+        // Separate directories from specific files
         $directory_prefixes = array();
+        $specific_files = array();
+        
         foreach ($exclusion_paths as $path) {
-            $directory_prefixes[] = rtrim($path, '/') . '/';
+            // Check if this looks like a specific file (has extension)
+            if (pathinfo($path, PATHINFO_EXTENSION)) {
+                $specific_files[] = $path;
+            } else {
+                // Treat as directory - add trailing slash
+                $directory_prefixes[] = rtrim($path, '/') . '/';
+            }
         }
         
         // Sort by length (longest first) for efficient matching
         usort($directory_prefixes, function($a, $b) {
+            return strlen($b) - strlen($a);
+        });
+        
+        // Sort specific files by length (longest first)
+        usort($specific_files, function($a, $b) {
             return strlen($b) - strlen($a);
         });
         
@@ -238,6 +262,7 @@ class Custom_Migrator_Helper {
         
         return array(
             'directory_prefixes' => $directory_prefixes,
+            'specific_files' => $specific_files,
             'extension_regex' => $extension_regex,
             'cache_regex' => $cache_regex
         );
@@ -443,8 +468,33 @@ class Custom_Migrator_Helper {
         $name = self::encode_for_binary($filename);
         $path = self::encode_for_binary($file_path);
         
+        // CRITICAL FIX: Ensure encoded strings don't exceed field limits
+        // If encoded filename is too long, truncate it to fit within 255 bytes
+        if (strlen($name) > 255) {
+            $name = substr($name, 0, 255);
+        }
+        
+        // If encoded path is too long, truncate it to fit within 4112 bytes
+        if (strlen($path) > 4112) {
+            $path = substr($path, 0, 4112);
+        }
+        
+        // CRITICAL VALIDATION: Ensure size and date are valid integers
+        if (!is_int($file_size) || $file_size < 0) {
+            throw new Exception("Invalid file size: $file_size");
+        }
+        
+        if (!is_int($file_date) || $file_date <= 0) {
+            throw new Exception("Invalid file date: $file_date");
+        }
+        
         // Create binary block with safe character encoding
         $block = pack($format['pack'], $name, $file_size, $file_date, $path);
+        
+        // CRITICAL VALIDATION: Ensure block is exactly the expected size
+        if (strlen($block) !== $format['size']) {
+            throw new Exception("Binary block size mismatch: expected {$format['size']}, got " . strlen($block));
+        }
         
         return $block;
     }

@@ -61,6 +61,7 @@ class Custom_Migrator_File_Enumerator {
         $stats = array(
             'files_found' => 0,
             'files_excluded' => 0,
+            'files_excluded_by_size' => 0,  // Track large file exclusions separately
             'total_size' => 0,
             'errors' => 0,
             'start_time' => $start_time
@@ -99,7 +100,8 @@ class Custom_Migrator_File_Enumerator {
             'validate_files' => true,
             'skip_unreadable' => true,
             'log_errors' => true,
-            'use_unlimited_execution' => false  // Enable unlimited execution time for enumeration
+            'use_unlimited_execution' => false,  // Enable unlimited execution time for enumeration
+            'max_file_size' => 500 * 1024 * 1024  // 500MB file size limit for production safety
         );
         
         return array_merge($defaults, $options);
@@ -166,6 +168,9 @@ class Custom_Migrator_File_Enumerator {
                 
                 if ($result['excluded']) {
                     $stats['files_excluded']++;
+                    if ($result['excluded_by_size']) {
+                        $stats['files_excluded_by_size']++;
+                    }
                     continue;
                 }
                 
@@ -210,6 +215,7 @@ class Custom_Migrator_File_Enumerator {
     private function process_file($file, $config) {
         $result = array(
             'excluded' => false,
+            'excluded_by_size' => false,  // Track if excluded due to size limit
             'error' => null,
             'csv_data' => null,
             'size' => 0
@@ -239,6 +245,17 @@ class Custom_Migrator_File_Enumerator {
         
         if ($file_size === false || $file_mtime === false) {
             $result['error'] = 'Cannot get file stats: ' . basename($real_path);
+            return $result;
+        }
+        
+        // PRODUCTION SAFETY: Exclude files larger than configured limit to prevent memory/timeout issues
+        // This protects both regular and fallback exports from handling massive files
+        if ($file_size > $config['max_file_size']) {
+            // Log large file exclusion for monitoring
+            $size_limit_mb = round($config['max_file_size'] / (1024 * 1024));
+            $this->filesystem->log('Excluding large file: ' . basename($real_path) . ' (' . $this->format_bytes($file_size) . ') - exceeds ' . $size_limit_mb . 'MB limit');
+            $result['excluded'] = true;
+            $result['excluded_by_size'] = true;
             return $result;
         }
         
@@ -318,10 +335,14 @@ class Custom_Migrator_File_Enumerator {
         $elapsed = microtime(true) - $stats['start_time'];
         $rate = $stats['files_found'] / max($elapsed, 0.1);
         
+        $size_exclusions = $stats['files_excluded_by_size'] > 0 ? 
+            sprintf(', %d large files excluded', $stats['files_excluded_by_size']) : '';
+            
         $this->filesystem->log(sprintf(
-            'Enumeration progress: %d files found, %d excluded, %s total size (%.1f files/sec)',
+            'Enumeration progress: %d files found, %d excluded%s, %s total size (%.1f files/sec)',
             $stats['files_found'],
             $stats['files_excluded'],
+            $size_exclusions,
             $this->format_bytes($stats['total_size']),
             $rate
         ));
@@ -333,10 +354,19 @@ class Custom_Migrator_File_Enumerator {
      * @param array $stats Final statistics.
      */
     private function log_enumeration_results($stats) {
+        // Enhanced final logging with large file exclusion details
+        $size_exclusion_details = '';
+        if ($stats['files_excluded_by_size'] > 0) {
+            $size_limit_mb = round(500, 0); // Default 500MB limit for logging
+            $size_exclusion_details = sprintf(' (including %d files >%dMB)', 
+                $stats['files_excluded_by_size'], $size_limit_mb);
+        }
+        
         $this->filesystem->log(sprintf(
-            'File enumeration completed: %d files found, %d excluded, %d errors, %s total size in %.2f seconds',
+            'File enumeration completed: %d files found, %d excluded%s, %d errors, %s total size in %.2f seconds',
             $stats['files_found'],
             $stats['files_excluded'],
+            $size_exclusion_details,
             $stats['errors'],
             $this->format_bytes($stats['total_size']),
             $stats['elapsed_time']

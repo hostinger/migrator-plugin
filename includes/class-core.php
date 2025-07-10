@@ -175,14 +175,18 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Check for stuck exports with optimized timeouts
+        // Check for stuck exports with more conservative timeouts to prevent premature restarts
         $stuck_statuses = ['starting', 'exporting', 'resuming'];
-        if (in_array($status, $stuck_statuses) && $time_diff > 120) { // 2 minutes timeout
-            $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds. Attempting recovery.");
-            
-            // Try to restart the export
-            $this->force_export_restart();
-            return;
+        if (in_array($status, $stuck_statuses)) {
+            if ($time_diff > 300) { // 5 minutes timeout (was 2 minutes)
+                $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds. Attempting recovery.");
+                
+                // Try to restart the export
+                $this->force_export_restart();
+                return;
+            } else if ($time_diff > 180) { // 3 minutes - just log warning
+                $this->filesystem->log("Export running longer than expected in '$status' state ($time_diff seconds), monitoring...");
+            }
         }
         
         // ENHANCED: Check for failed resume on paused exports
@@ -940,21 +944,22 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Enhanced stuck detection for all processing statuses
+        // PRODUCTION-SAFE: Very conservative stuck detection for high-volume production (3000 sites/week)
         $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
         if (in_array($status, $processing_statuses)) {
-            // Optimized timeouts for 10-second processing windows
-            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
+            // Very conservative timeouts to prevent premature restarts on large databases
+            if ($time_diff > 600) { // 10 minutes warning (was 3 minutes)
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
-                // Try to restart if really stuck
-                if ($time_diff > 120) { 
+                // Only restart if REALLY stuck - large databases can take time
+                if ($time_diff > 1200) { // 20 minutes restart (was 5 minutes)
+                    $this->filesystem->log("CRITICAL: Export stuck for 20+ minutes, forcing restart");
                     $this->force_export_restart();
                 }
                 
                 wp_send_json_success(array(
                     'status' => $status . '_stuck',
-                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Attempting recovery...",
+                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Monitoring for recovery...",
                     'time_since_update' => $time_diff
                 ));
                 return;
@@ -1569,21 +1574,21 @@ class Custom_Migrator_Core {
         $current_time = time();
         $time_diff = $current_time - $modified_time;
         
-        // Enhanced stuck detection for all processing statuses
+        // Enhanced stuck detection for all processing statuses with conservative timeouts  
         $processing_statuses = ['starting', 'initializing', 'exporting', 'exporting_database', 'generating_metadata', 'finalizing', 'resuming'];
         if (in_array($status, $processing_statuses)) {
-            // Optimized timeouts for 10-second processing windows
-            if ($time_diff > 60) { // 1 minute timeout for starting/initializing
+            // More conservative timeouts to prevent premature restarts
+            if ($time_diff > 180) { // 3 minutes warning (was 1 minute)
                 $this->filesystem->log("Export appears stuck in '$status' state for $time_diff seconds");
                 
                 // Try to restart if really stuck
-                if ($time_diff > 120) { 
+                if ($time_diff > 300) { // 5 minutes restart (was 2 minutes)
                     $this->force_export_restart();
                 }
                 
                 wp_send_json_success(array(
                     'status' => $status . '_stuck',
-                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Attempting recovery...",
+                    'message' => "Export may be stuck (no activity for " . round($time_diff/60, 1) . " minutes). Monitoring for recovery...",
                     'time_since_update' => $time_diff
                 ));
                 return;

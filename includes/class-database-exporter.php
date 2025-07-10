@@ -13,6 +13,8 @@
  */
 class Custom_Migrator_Database_Exporter {
 
+
+
     /**
      * The filesystem handler.
      *
@@ -176,10 +178,16 @@ class Custom_Migrator_Database_Exporter {
         $is_resume = ($this->state['tables_processed'] > 0);
         $mode = $is_resume ? 'a' : 'w';
         
-        // For compression, we'll use temp file approach
-        // Use consistent temp file path (deterministic naming)
-        $this->temp_file_path = $this->get_temp_file_path($sql_file);
-        $this->state['temp_file_path'] = $this->temp_file_path;
+        // CRITICAL FIX: For resume operations, reuse the existing temp file path
+        // This prevents creating multiple temp files and losing data
+        if ($is_resume && !empty($this->state['temp_file_path'])) {
+            $this->temp_file_path = $this->state['temp_file_path'];
+            $this->filesystem->log("Resuming with existing temp file: " . basename($this->temp_file_path));
+        } else {
+            // For fresh start, get new temp file path (deterministic naming)
+            $this->temp_file_path = $this->get_temp_file_path($sql_file);
+            $this->state['temp_file_path'] = $this->temp_file_path;
+        }
         
         // ENHANCED: Validate directory and permissions before attempting file creation
         $temp_dir = dirname($this->temp_file_path);
@@ -198,6 +206,9 @@ class Custom_Migrator_Database_Exporter {
         if (!$is_resume) {
             $this->cleanup_old_temp_files($temp_dir);
         }
+        
+        // ENHANCED: Log temp file being used for better debugging
+        $this->filesystem->log("Using temp file: " . basename($this->temp_file_path));
         
         $handle = fopen($this->temp_file_path, $mode);
         if (!$handle) {
@@ -731,8 +742,20 @@ class Custom_Migrator_Database_Exporter {
         fclose($output_handle);
 
         // Handle compression using the same temp file that was created
-        $this->filesystem->log("Finalizing export: temp file = " . $this->temp_file_path . ", target = " . $sql_file);
-        $this->handle_compression($this->temp_file_path, $sql_file);
+        $this->filesystem->log("Finalizing export:");
+        $this->filesystem->log("- Temp file: " . ($this->temp_file_path ? basename($this->temp_file_path) : 'none'));
+        $this->filesystem->log("- Target file: " . basename($sql_file));
+        $this->filesystem->log("- Compression: " . ($this->config['compression'] !== 'none'));
+        
+        if ($this->temp_file_path && file_exists($this->temp_file_path)) {
+            $temp_size = filesize($this->temp_file_path);
+            $this->filesystem->log("- Temp file size: " . $this->format_bytes($temp_size));
+            
+            $this->handle_compression($this->temp_file_path, $sql_file);
+        } else {
+            $this->filesystem->log("ERROR: Temp file does not exist: " . ($this->temp_file_path ? $this->temp_file_path : 'undefined'));
+            throw new Exception("Temp file does not exist: " . ($this->temp_file_path ? basename($this->temp_file_path) : 'undefined'));
+        }
     }
 
     /**
@@ -886,7 +909,7 @@ class Custom_Migrator_Database_Exporter {
 
     /**
      * Get temporary file path for processing.
-     * Uses deterministic naming so all chunks use the same temp file.
+     * PRODUCTION-SAFE: Only adds uniqueness when conflicts are detected.
      *
      * @param string $sql_file Target SQL file path.
      * @return string Temporary file path.
@@ -907,8 +930,39 @@ class Custom_Migrator_Database_Exporter {
             $base_name = substr($base_name, 0, -4);
         }
         
+        // CONSERVATIVE APPROACH: Use standard naming first
         $temp_name = 'db_export_temp_' . $base_name . '.sql';
-        return $temp_dir . '/' . $temp_name;
+        $temp_path = $temp_dir . '/' . $temp_name;
+        
+        // ENHANCED SAFETY CHECK: Only add uniqueness if file exists and is from a different session
+        if (file_exists($temp_path)) {
+            $file_age = time() - filemtime($temp_path);
+            
+            // If temp file exists and is very recent (less than 2 minutes), check if it's our session
+            if ($file_age < 120) {
+                // Check if this might be from the current export session by examining file size
+                $file_size = filesize($temp_path);
+                
+                // If file is very small (less than 1KB), it's likely abandoned - safe to reuse
+                // If file is substantial but old enough (over 5 minutes), also safe to reuse
+                if ($file_size < 1024 || $file_age > 300) {
+                    $this->filesystem->log("Reusing temp file (size: " . $this->format_bytes($file_size) . ", age: " . round($file_age) . "s): " . basename($temp_path));
+                } else {
+                    // Recent substantial file - might be from concurrent process, make unique
+                    $process_id = function_exists('getmypid') ? getmypid() : mt_rand(10000, 99999);
+                    $microtime = str_replace('.', '', microtime(true));
+                    $temp_name = 'db_export_temp_' . $base_name . '_' . $process_id . '_' . $microtime . '.sql';
+                    $temp_path = $temp_dir . '/' . $temp_name;
+                    
+                    $this->filesystem->log("Temp file conflict detected, using unique name: " . basename($temp_path));
+                }
+            } else {
+                // Old temp file, safe to reuse after cleanup
+                $this->filesystem->log("Reusing temp file after cleanup: " . basename($temp_path));
+            }
+        }
+        
+        return $temp_path;
     }
 
     /**
@@ -935,11 +989,26 @@ class Custom_Migrator_Database_Exporter {
         }
 
         $files = glob($directory . '/db_export_temp_*.sql');
+        $cleaned_count = 0;
+        $current_time = time();
+        
         foreach ($files as $file) {
             if (is_file($file)) {
-                @unlink($file);
-                $this->filesystem->log("Cleaned up old temp file: " . basename($file));
+                // Only clean up files older than 1 hour to avoid removing active temp files
+                $file_age = $current_time - filemtime($file);
+                if ($file_age > 3600) { // 1 hour
+                    if (@unlink($file)) {
+                        $cleaned_count++;
+                        $this->filesystem->log("Cleaned up old temp file: " . basename($file) . " (age: " . round($file_age/60) . " minutes)");
+                    }
+                } else {
+                    $this->filesystem->log("Keeping recent temp file: " . basename($file) . " (age: " . round($file_age/60) . " minutes)");
+                }
             }
+        }
+        
+        if ($cleaned_count > 0) {
+            $this->filesystem->log("Cleaned up {$cleaned_count} old temp files");
         }
     }
 
