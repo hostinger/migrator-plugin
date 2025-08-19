@@ -117,6 +117,9 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_get_export_status_display', array( $this, 'handle_get_export_status_display' ) );
         add_action( 'wp_ajax_cm_get_s3_status_display', array( $this, 'handle_get_s3_status_display' ) );
         
+        // Plugin management handlers
+        add_action( 'wp_ajax_cm_delete_plugin', array( $this, 'handle_delete_plugin' ) );
+        
         // FALLBACK AJAX EXPORT SYSTEM - Following All-in-One WP Migration approach
         // Register both privileged and non-privileged actions for maximum compatibility
         add_action( 'wp_ajax_cm_fallback_export', array( $this->fallback_exporter, 'handle_fallback_export' ) );
@@ -1822,6 +1825,16 @@ class Custom_Migrator_Core {
             'timestamp' => time(),
             'file_mtime' => $file_mtime
         ) );
+    }
+
+    /**
+     * Handle the AJAX request to delete the plugin.
+     *
+     * @return void
+     */
+    public function handle_delete_plugin() {
+        // Delegate to admin class which has the deletion logic
+        $this->admin->delete_plugin();
     }
 
 

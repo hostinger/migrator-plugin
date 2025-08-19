@@ -806,4 +806,56 @@ jQuery(document).ready(function($) {
             }
         });
     }
+    
+    // Delete plugin functionality
+    $("#delete-plugin").on("click", function(e) {
+        e.preventDefault();
+        
+        // Show immediate feedback
+        var $button = $(this);
+        var originalText = $button.html();
+        $button.prop('disabled', true).html('<span class="dashicons dashicons-update-alt" style="animation: spin 1s linear infinite; vertical-align: middle;"></span> Deleting...');
+        $("#delete-plugin-status").show().html('<span style="color: #d63638;">Deleting plugin and all associated files...</span>');
+        
+        // Make AJAX request to delete plugin
+        $.ajax({
+            url: cm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'cm_delete_plugin',
+                nonce: cm_ajax.nonce
+            },
+            timeout: 30000, // 30 second timeout
+            success: function(response) {
+                if (response.success) {
+                    $("#delete-plugin-status").html('<span style="color: #00a32a;"><span class="dashicons dashicons-yes"></span> ' + response.data.message + '</span>');
+                    
+                    // Redirect after 2 seconds
+                    setTimeout(function() {
+                        if (response.data.redirect_url) {
+                            window.location.href = response.data.redirect_url;
+                        } else {
+                            window.location.href = window.location.protocol + '//' + window.location.host + '/wp-admin/plugins.php';
+                        }
+                    }, 2000);
+                } else {
+                    // Show error
+                    var errorMsg = response.data ? response.data.message : "Plugin deletion failed.";
+                    $("#delete-plugin-status").html('<span style="color: #d63638;"><span class="dashicons dashicons-no"></span> Error: ' + errorMsg + '</span>');
+                    $button.prop('disabled', false).html(originalText);
+                }
+            },
+            error: function(xhr, status, error) {
+                var errorMsg = "Server error occurred during plugin deletion.";
+                if (status === 'timeout') {
+                    errorMsg = "Request timed out. The plugin may still be being deleted.";
+                }
+                
+                $("#delete-plugin-status").html('<span style="color: #d63638;"><span class="dashicons dashicons-no"></span> Error: ' + errorMsg + '</span>');
+                $button.prop('disabled', false).html(originalText);
+                
+                console.log('Plugin deletion error:', {status: status, error: error, xhr: xhr});
+            }
+        });
+    });
 });

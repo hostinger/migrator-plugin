@@ -15,7 +15,13 @@ if ( ! defined( 'WPINC' ) ) {
     <h1>
         <span class="dashicons dashicons-migrate" style="font-size: 30px; height: 30px; width: 30px; padding-right: 10px;"></span>
         <?php echo esc_html( get_admin_page_title() ); ?>
+        <button type="button" id="delete-plugin" class="button button-secondary" style="background-color: #dc3232; border-color: #dc3232; color: white; float: right; margin-top: 5px;">
+            <span class="dashicons dashicons-trash" style="vertical-align: middle;"></span>
+            <?php esc_html_e( 'Delete Plugin', 'custom-migrator' ); ?>
+        </button>
     </h1>
+    
+    <div id="delete-plugin-status" style="margin-bottom: 15px; display: none;"></div>
     
     <?php
     // Show success message if export was started

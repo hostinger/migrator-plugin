@@ -369,4 +369,117 @@ class Custom_Migrator_Admin {
         
         return $size;
     }
+
+    /**
+     * Handle plugin deletion request.
+     * Reuses the existing cleanup logic from uninstall.php for consistency.
+     *
+     * @return void
+     */
+    public function delete_plugin() {
+        // Verify user capabilities
+        if ( ! current_user_can( 'activate_plugins' ) ) {
+            wp_send_json_error( array( 'message' => 'You do not have sufficient permissions to delete plugins.' ) );
+            return;
+        }
+
+        try {
+            // Get plugin file path
+            $plugin_file = CUSTOM_MIGRATOR_BASENAME;
+            $plugin_dir = CUSTOM_MIGRATOR_PLUGIN_DIR;
+            
+            // Deactivate the plugin first
+            if ( is_plugin_active( $plugin_file ) ) {
+                deactivate_plugins( $plugin_file );
+                $this->filesystem->log( 'Plugin deactivated before deletion' );
+            }
+            
+            // Reuse the existing cleanup function for consistency
+            $this->run_plugin_cleanup();
+            
+            // Delete plugin directory using the existing method
+            if ( file_exists( $plugin_dir ) ) {
+                $this->delete_directory_recursive_safe( $plugin_dir );
+                $this->filesystem->log( 'Plugin directory deleted: ' . $plugin_dir );
+            }
+            
+            wp_send_json_success( array( 
+                'message' => 'Plugin deleted successfully. You will be redirected to the plugins page.',
+                'redirect_url' => admin_url( 'plugins.php' )
+            ) );
+            
+        } catch ( Exception $e ) {
+            wp_send_json_error( array( 'message' => 'Error deleting plugin: ' . $e->getMessage() ) );
+        }
+    }
+
+    /**
+     * Run the same cleanup that happens during uninstall.
+     * This ensures consistency between manual deletion and WordPress uninstall.
+     *
+     * @return void
+     */
+    private function run_plugin_cleanup() {
+        // Clean up any scheduled events (same as in uninstall but more comprehensive)
+        wp_clear_scheduled_hook( 'cm_run_export' );
+        wp_clear_scheduled_hook( 'cm_monitor_export' );
+        wp_clear_scheduled_hook( 'cm_run_export_direct' );
+        wp_clear_scheduled_hook( 'cm_process_export_step_fallback' );
+        
+        // Remove plugin options (same as in uninstall.php)
+        delete_option( 'custom_migrator_filenames' );
+        delete_option( 'custom_migrator_access_token' );
+        delete_option( 'custom_migrator_auth' );
+        delete_option( 'custom_migrator_export_subdir' );
+        
+        // Clean up export directory (same as in uninstall.php)
+        $export_dir = WP_CONTENT_DIR . '/hostinger-migration-archives';
+        
+        if ( file_exists( $export_dir ) && is_dir( $export_dir ) ) {
+            $this->delete_directory_recursive_safe( $export_dir );
+            $this->filesystem->log( 'Export directory cleaned up: ' . $export_dir );
+        }
+    }
+
+    /**
+     * Safely delete directory using the same logic as uninstall.php.
+     * This replicates the custom_migrator_delete_directory function for consistency.
+     *
+     * @param string $dir Directory to delete.
+     * @return bool True on success.
+     */
+    private function delete_directory_recursive_safe( $dir ) {
+        if ( ! file_exists( $dir ) ) {
+            return true;
+        }
+        
+        if ( ! is_dir( $dir ) ) {
+            return @unlink( $dir );
+        }
+        
+        // Get all items in the directory (same as uninstall.php)
+        $items = @scandir( $dir );
+        if ( $items === false ) {
+            return false;
+        }
+        
+        foreach ( $items as $item ) {
+            if ( $item == '.' || $item == '..' ) {
+                continue;
+            }
+            
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            
+            if ( is_dir( $path ) ) {
+                // Recursively delete subdirectories
+                $this->delete_directory_recursive_safe( $path );
+            } else {
+                // Delete files
+                @unlink( $path );
+            }
+        }
+        
+        // Finally remove the directory itself
+        return @rmdir( $dir );
+    }
 }
