@@ -88,6 +88,10 @@ class Custom_Migrator_Core {
         add_action( 'admin_menu', array( $admin, 'add_admin_menu' ) );
         add_action( 'admin_enqueue_scripts', array( $admin, 'enqueue_scripts' ) );
         add_action( 'admin_init', array( $admin, 'handle_form_submission' ) );
+
+        // Self-heal the export directory protection on existing installs (cheap no-op
+        // once the .htaccess/index.php guards are already in place).
+        add_action( 'admin_init', array( $this, 'ensure_export_dir_protected' ) );
         
         // Add settings link to the plugins page
         add_filter( 'plugin_action_links_' . plugin_basename( CUSTOM_MIGRATOR_PLUGIN_DIR . 'custom-migrator.php' ), 
@@ -95,6 +99,19 @@ class Custom_Migrator_Core {
         
         // Add custom cron schedules
         add_filter('cron_schedules', array($this, 'add_custom_cron_schedules'));
+    }
+
+    /**
+     * Make sure the export directory still carries its access protection.
+     *
+     * Older versions only wrote .htaccess/index.php at directory creation time, and the
+     * fallback exporter used to create the directory without them, so existing installs
+     * can have an unprotected export directory.
+     *
+     * @return void
+     */
+    public function ensure_export_dir_protected() {
+        $this->filesystem->protect_export_dir();
     }
 
     /**
@@ -106,14 +123,14 @@ class Custom_Migrator_Core {
         // AJAX handlers
         add_action( 'wp_ajax_cm_start_export', array( $this, 'handle_start_export' ) );
         add_action( 'wp_ajax_cm_check_status', array( $this, 'handle_check_status' ) );
-        add_action( 'wp_ajax_cm_process_export_step', array( $this, 'process_export_step' ) );
+        add_action( 'wp_ajax_cm_process_export_step', array( $this, 'handle_process_export_step' ) );
         add_action( 'wp_ajax_cm_force_continue', array( $this, 'handle_force_continue' ) );
         add_action( 'wp_ajax_cm_run_export_now', array( $this, 'handle_run_export_now' ) );
         add_action( 'wp_ajax_cm_upload_to_s3', array( $this, 'handle_upload_to_s3' ) );
         add_action( 'wp_ajax_cm_check_s3_status', array( $this, 'handle_check_s3_status' ) );
         add_action( 'wp_ajax_cm_debug_status', array( $this, 'handle_debug_status' ) );
         
-        // Status display handlers (no privilege required for UI display)
+        // Status display handlers (read-only, admin capability required)
         add_action( 'wp_ajax_cm_get_export_status_display', array( $this, 'handle_get_export_status_display' ) );
         add_action( 'wp_ajax_cm_get_s3_status_display', array( $this, 'handle_get_s3_status_display' ) );
         
@@ -121,11 +138,10 @@ class Custom_Migrator_Core {
         add_action( 'wp_ajax_cm_delete_plugin', array( $this, 'handle_delete_plugin' ) );
         
         // FALLBACK AJAX EXPORT SYSTEM - Following All-in-One WP Migration approach
-        // Register both privileged and non-privileged actions for maximum compatibility
+        // Privileged only: these handlers run a full site export, so they must never be
+        // reachable by unauthenticated visitors (no wp_ajax_nopriv registration).
         add_action( 'wp_ajax_cm_fallback_export', array( $this->fallback_exporter, 'handle_fallback_export' ) );
-        add_action( 'wp_ajax_nopriv_cm_fallback_export', array( $this->fallback_exporter, 'handle_fallback_export' ) );
         add_action( 'wp_ajax_cm_fallback_status', array( $this->fallback_exporter, 'handle_fallback_status' ) );
-        add_action( 'wp_ajax_nopriv_cm_fallback_status', array( $this->fallback_exporter, 'handle_fallback_status' ) );
         
         add_action( 'cm_run_export', array( $this, 'run_export' ) );
     }
@@ -391,17 +407,16 @@ class Custom_Migrator_Core {
      * @return void
      */
     public function handle_run_export_now() {
-        // Check if this is a background request
-        $is_background = isset($_REQUEST['background_mode']) && $_REQUEST['background_mode'] === '1';
-        
-        if (!$is_background) {
-            // For foreground requests, use standard WordPress security
-            if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
-                wp_send_json_error( array( 'message' => 'Security check failed' ) );
-            }
+        // Security check - unconditional. 'background_mode' used to skip this, but it is
+        // just a request parameter that any caller can set. Cookie-less background triggers
+        // cannot authenticate here in any case; they run through the cm_run_export cron hook.
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
         }
-        // Background requests are triggered by authenticated requests, so they don't need additional auth
-        
+
+        // Only used to decide how aggressively to detach this (long-running) request.
+        $is_background = isset($_REQUEST['background_mode']) && $_REQUEST['background_mode'] === '1';
+
         $this->filesystem->log('Processing export request (background: ' . ($is_background ? 'yes' : 'no') . ')');
         
         // Set proper execution environment for background processing
@@ -483,6 +498,9 @@ class Custom_Migrator_Core {
             
             // Important: Delete old filenames to force regeneration with new secure names
             delete_option('custom_migrator_filenames');
+
+            // Drop any temp file name left over from a previous export
+            delete_option(Custom_Migrator_Database_Exporter::TEMP_FILE_OPTION);
 
             // Update export status and immediately start background processing
             $this->filesystem->write_status( 'starting' );
@@ -656,27 +674,35 @@ class Custom_Migrator_Core {
     }
 
     /**
+     * AJAX entry point for step-by-step export processing.
+     *
+     * @return array Updated parameters.
+     */
+    public function handle_process_export_step() {
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
+        $params = stripslashes_deep( array_merge( $_GET, $_POST ) );
+
+        return $this->process_export_step( $params );
+    }
+
+    /**
      * Process export step by step (simple automation).
+     *
+     * Internal only: every caller supplies its own parameters. Request-driven callers must
+     * go through handle_process_export_step(), which performs the capability/nonce check.
      *
      * @param array $params Export parameters.
      * @return array Updated parameters.
      */
     public function process_export_step($params = array()) {
-        // Get params from request if not provided
-        if (empty($params)) {
-            $params = stripslashes_deep(array_merge($_GET, $_POST));
-        }
-
-        // Detect execution context
+        // Detect execution context (logging and timeout handling only)
         $is_cron = defined('DOING_CRON') && DOING_CRON;
         $is_ajax = defined('DOING_AJAX') && DOING_AJAX;
         $is_background = $is_cron || !$is_ajax;
-        
-        // Simple security check for non-background requests
-        if (!$is_background && !current_user_can('manage_options')) {
-            $this->filesystem->log('Security check failed - user lacks permissions');
-            return $params;
-        }
 
         $current_step = isset($params['step']) ? $params['step'] : 'unknown';
         $this->filesystem->log('Processing export step: ' . $current_step . ' (background: ' . ($is_background ? 'yes' : 'no') . ')');
@@ -1759,11 +1785,15 @@ class Custom_Migrator_Core {
 
     /**
      * Handle AJAX request to get export status for UI display.
-     * No security check needed as this just reads status text file content.
      *
      * @return void
      */
     public function handle_get_export_status_display() {
+        // Security check - the export status reveals migration activity on the site.
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
         // Enhanced cache-busting headers
         header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0');
         header('Pragma: no-cache');
@@ -1794,11 +1824,15 @@ class Custom_Migrator_Core {
 
     /**
      * Handle AJAX request to get S3 upload status for UI display.
-     * No security check needed as this just reads status text file content.
      *
      * @return void
      */
     public function handle_get_s3_status_display() {
+        // Security check - the export status reveals migration activity on the site.
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
         // Enhanced cache-busting headers
         header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0');
         header('Pragma: no-cache');

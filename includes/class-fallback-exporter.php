@@ -43,6 +43,11 @@ class Custom_Migrator_Fallback_Exporter {
      * Handle fallback export AJAX requests
      */
     public function handle_fallback_export() {
+        // Security check - must run before any filesystem work is performed.
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
         try {
             // Get parameters from AJAX request first
             $step = isset($_POST['step']) ? sanitize_text_field($_POST['step']) : 'init';
@@ -52,7 +57,14 @@ class Custom_Migrator_Fallback_Exporter {
             $lock_file = $this->filesystem->get_export_dir() . '/fallback_export.lock';
             
             // Generate or get session ID for this export
-            $session_id = isset($params['session_id']) ? $params['session_id'] : uniqid('fallback_', true);
+            $session_id = (isset($params['session_id']) && is_scalar($params['session_id']))
+                ? sanitize_key((string) $params['session_id'])
+                : '';
+            if ($session_id === '') {
+                // No more_entropy: the generated id must survive sanitize_key() on the
+                // follow-up requests that echo it back.
+                $session_id = uniqid('fallback_');
+            }
             
             // Check if another fallback export is already running
             if (file_exists($lock_file)) {
@@ -86,9 +98,9 @@ class Custom_Migrator_Fallback_Exporter {
             
             // Create or update lock file for this session (only for init step or if no lock exists)
             if ($step === 'init' || !file_exists($lock_file)) {
-                if (!is_dir($this->filesystem->get_export_dir())) {
-                    wp_mkdir_p($this->filesystem->get_export_dir());
-                }
+                // Always go through the filesystem helper so the directory keeps its
+                // .htaccess/index.php protection.
+                $this->filesystem->create_export_dir();
                 $lock_data = array(
                     'session_id' => $session_id,
                     'time' => time(),
@@ -124,11 +136,9 @@ class Custom_Migrator_Fallback_Exporter {
                 $this->set_fallback_exclusion_paths();
             }
             
-            // Initialize fallback export directory
+            // Initialize fallback export directory (also (re)applies its access protection)
+            $this->filesystem->create_export_dir();
             $export_dir = $this->filesystem->get_export_dir();
-            if (!is_dir($export_dir)) {
-                wp_mkdir_p($export_dir);
-            }
             
             $this->filesystem->log("Fallback export step: $step");
             
@@ -191,6 +201,11 @@ class Custom_Migrator_Fallback_Exporter {
      * Handle fallback export status check
      */
     public function handle_fallback_status() {
+        // Security check
+        if ( ! current_user_can( 'manage_options' ) || ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+        }
+
         $status_file = $this->filesystem->get_status_file_path();
         
         if (file_exists($status_file)) {
@@ -596,7 +611,6 @@ class Custom_Migrator_Fallback_Exporter {
                     'total_tables' => isset($params['total_tables']) ? (int)$params['total_tables'] : 0,
                     'rows_exported' => isset($params['rows_exported']) ? (int)$params['rows_exported'] : 0,
                     'bytes_written' => isset($params['bytes_written']) ? (int)$params['bytes_written'] : 0,
-                    'temp_file_path' => isset($params['temp_file_path']) ? $params['temp_file_path'] : null,
                 );
                 $this->filesystem->log("Database export will resume with state: " . json_encode($resume_state));
             } else {
@@ -649,8 +663,7 @@ class Custom_Migrator_Fallback_Exporter {
                         'table_offset' => isset($result['state']['table_offset']) ? $result['state']['table_offset'] : 0,
                         'total_tables' => $result['total_tables'],
                         'rows_exported' => $result['rows_exported'],
-                        'bytes_written' => $result['bytes_written'],
-                        'temp_file_path' => isset($result['state']['temp_file_path']) ? $result['state']['temp_file_path'] : null
+                        'bytes_written' => $result['bytes_written']
                     ))
                 );
             }

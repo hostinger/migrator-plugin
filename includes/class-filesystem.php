@@ -69,43 +69,101 @@ class Custom_Migrator_Filesystem {
     }
 
     /**
-     * Create the export directory.
+     * Create the export directory and (re)apply its access protection.
+     *
+     * Safe to call repeatedly. The guard files are (re)written whenever they are missing
+     * or out of date, so a directory that was created without them gets healed.
      *
      * @throws Exception If the directory cannot be created.
      */
     public function create_export_dir() {
         $dir = $this->get_export_dir();
-        
+
         if (!file_exists($dir)) {
             if (!wp_mkdir_p($dir)) {
                 throw new Exception('Cannot create export directory: ' . $dir);
             }
-            
-            // Create an index.php file to prevent directory listing
-            file_put_contents($dir . '/index.php', "<?php\n// Silence is golden.");
-            
-            // Create an .htaccess file with necessary access for hosting providers
-            // but still blocking public access
-            $htaccess = "# Disable directory browsing\n" .
-                       "Options -Indexes\n\n" .
-                       "# Allow specific file types to be downloaded directly\n" .
-                       "<FilesMatch \"\\.(hstgr|sql|sql\\.gz|json|log|txt)$\">\n" .
-                       "  Order Allow,Deny\n" .
-                       "  Allow from all\n" .
-                       "</FilesMatch>\n\n" .
-                       "# Allow access to status file\n" .
-                       "<Files \"export-status.txt\">\n" .
-                       "  Order Allow,Deny\n" .
-                       "  Allow from all\n" .
-                       "</Files>\n\n" .
-                       "# Deny access to sensitive files\n" .
-                       "<Files \"export-log.txt\">\n" .
-                       "  Order Allow,Deny\n" .
-                       "  Deny from all\n" .
-                       "</Files>\n";
-            
-            file_put_contents($dir . '/.htaccess', $htaccess);
         }
+
+        $this->protect_export_dir();
+    }
+
+    /**
+     * Write the guard files that keep the export directory from being browsed, executed
+     * or trawled for its non-artifact files (status, step, lock and temp files).
+     *
+     * @return void
+     */
+    public function protect_export_dir() {
+        $dir = $this->get_export_dir();
+
+        if (!is_dir($dir)) {
+            return;
+        }
+
+        // Prevent directory listing on servers that ignore .htaccess.
+        $index_file = $dir . '/index.php';
+        if (!file_exists($index_file)) {
+            @file_put_contents($index_file, "<?php\n// Silence is golden.");
+        }
+
+        // Rewrite .htaccess only when it differs, so we do not touch it on every request.
+        $htaccess_file = $dir . '/.htaccess';
+        $htaccess = $this->get_htaccess_contents();
+
+        if (!file_exists($htaccess_file) || @file_get_contents($htaccess_file) !== $htaccess) {
+            @file_put_contents($htaccess_file, $htaccess);
+        }
+    }
+
+    /**
+     * Build the .htaccess rules for the export directory.
+     *
+     * Default-deny, with an allow list limited to the randomly-named export artifacts
+     * produced by generate_secure_filename(). The 16 hex character token in the pattern
+     * is what keeps predictable files (export-status.txt, export-step.txt,
+     * fallback_export.lock, db_export_temp_*.sql, anything dropped by a third party)
+     * from being served. Both Apache 2.2 and 2.4 syntaxes are emitted so the rules do
+     * not silently no-op - or 500 - depending on which authz module is loaded.
+     *
+     * @return string The .htaccess contents.
+     */
+    private function get_htaccess_contents() {
+        return "# Hostinger Migrator export directory - do not edit, this file is regenerated.\n" .
+               "\n" .
+               "# Disable directory browsing\n" .
+               "Options -Indexes\n" .
+               "\n" .
+               "# Never execute PHP from this directory (mod_php; other SAPIs are covered by the default deny below)\n" .
+               "<IfModule mod_php.c>\n" .
+               "  php_flag engine off\n" .
+               "</IfModule>\n" .
+               "<IfModule mod_php7.c>\n" .
+               "  php_flag engine off\n" .
+               "</IfModule>\n" .
+               "<IfModule mod_php8.c>\n" .
+               "  php_flag engine off\n" .
+               "</IfModule>\n" .
+               "\n" .
+               "# Deny everything by default\n" .
+               "<IfModule mod_authz_core.c>\n" .
+               "  Require all denied\n" .
+               "</IfModule>\n" .
+               "<IfModule !mod_authz_core.c>\n" .
+               "  Order Allow,Deny\n" .
+               "  Deny from all\n" .
+               "</IfModule>\n" .
+               "\n" .
+               "# Allow only the generated export artifacts\n" .
+               "<FilesMatch \"^(content|db|meta|log)_[0-9a-f]{16}_[^/]*\\.(hstgr|sql|sql\\.gz|json|txt)$\">\n" .
+               "  <IfModule mod_authz_core.c>\n" .
+               "    Require all granted\n" .
+               "  </IfModule>\n" .
+               "  <IfModule !mod_authz_core.c>\n" .
+               "    Order Allow,Deny\n" .
+               "    Allow from all\n" .
+               "  </IfModule>\n" .
+               "</FilesMatch>\n";
     }
 
     /**

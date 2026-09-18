@@ -92,6 +92,7 @@ function processFallbackStep(step, params) {
         type: 'POST',
         data: {
             action: 'cm_fallback_export',
+            nonce: cm_ajax.nonce,
             step: step,
             params: params
         },

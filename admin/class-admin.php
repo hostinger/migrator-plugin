@@ -63,6 +63,9 @@ class Custom_Migrator_Admin {
             
             // Force regeneration of secure filenames
             delete_option('custom_migrator_filenames');
+
+            // Drop any temp file name left over from a previous export
+            delete_option('custom_migrator_db_temp_file');
             
             // Update export status
             $this->filesystem->write_status( 'starting' );
@@ -377,6 +380,13 @@ class Custom_Migrator_Admin {
      * @return void
      */
     public function delete_plugin() {
+        // Verify the request actually came from our admin screen (the client already sends
+        // this nonce); without it this endpoint is CSRF-able into deleting the plugin.
+        if ( ! check_ajax_referer( 'custom_migrator_nonce', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => 'Security check failed' ) );
+            return;
+        }
+
         // Verify user capabilities
         if ( ! current_user_can( 'activate_plugins' ) ) {
             wp_send_json_error( array( 'message' => 'You do not have sufficient permissions to delete plugins.' ) );
@@ -428,6 +438,7 @@ class Custom_Migrator_Admin {
         
         // Remove plugin options (same as in uninstall.php)
         delete_option( 'custom_migrator_filenames' );
+        delete_option( 'custom_migrator_db_temp_file' );
         delete_option( 'custom_migrator_access_token' );
         delete_option( 'custom_migrator_auth' );
         delete_option( 'custom_migrator_export_subdir' );

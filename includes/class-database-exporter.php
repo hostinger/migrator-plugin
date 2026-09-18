@@ -51,6 +51,14 @@ class Custom_Migrator_Database_Exporter {
     private $temp_file_path;
 
     /**
+     * Option key used to persist the active temp file name across resume requests.
+     *
+     * The temp file name is NEVER accepted from the HTTP request: doing so would let a
+     * caller steer the SQL dump to an arbitrary web-server-writable path.
+     */
+    const TEMP_FILE_OPTION = 'custom_migrator_db_temp_file';
+
+    /**
      * Initialize the class.
      *
      * @param array $config Export configuration.
@@ -178,22 +186,37 @@ class Custom_Migrator_Database_Exporter {
         $is_resume = ($this->state['tables_processed'] > 0);
         $mode = $is_resume ? 'a' : 'w';
         
-        // CRITICAL FIX: For resume operations, reuse the existing temp file path
-        // This prevents creating multiple temp files and losing data
-        if ($is_resume && !empty($this->state['temp_file_path'])) {
-            $this->temp_file_path = $this->state['temp_file_path'];
-            $this->filesystem->log("Resuming with existing temp file: " . basename($this->temp_file_path));
-        } else {
-            // For fresh start, get new temp file path (deterministic naming)
-            $this->temp_file_path = $this->get_temp_file_path($sql_file);
-            $this->state['temp_file_path'] = $this->temp_file_path;
+        // SECURITY: the temp file name is never taken from the request. On resume we recover
+        // the name the previous batch stored server-side, and the directory is always derived
+        // from the (server-generated) SQL file path.
+        $temp_dir = dirname($sql_file);
+        $this->temp_file_path = null;
+
+        if ($is_resume) {
+            $stored_name = get_option(self::TEMP_FILE_OPTION);
+            if (is_string($stored_name) && $this->is_valid_temp_file_name($stored_name)) {
+                $this->temp_file_path = $temp_dir . '/' . $stored_name;
+                $this->filesystem->log("Resuming with existing temp file: " . $stored_name);
+            } else {
+                $this->filesystem->log("WARNING: No valid stored temp file name found for resume, generating a new one");
+            }
         }
-        
+
+        if (empty($this->temp_file_path)) {
+            // Fresh start (or unrecoverable resume): derive a new temp file path and remember it.
+            $this->temp_file_path = $this->get_temp_file_path($sql_file);
+            update_option(self::TEMP_FILE_OPTION, basename($this->temp_file_path));
+        }
+
+        $this->state['temp_file_path'] = $this->temp_file_path;
+
         // ENHANCED: Validate directory and permissions before attempting file creation
-        $temp_dir = dirname($this->temp_file_path);
         if (!is_dir($temp_dir)) {
             $this->filesystem->log("Creating export directory: $temp_dir");
-            if (!wp_mkdir_p($temp_dir)) {
+            // Use the helper so the directory is created with its access protection in place.
+            $this->filesystem->create_export_dir();
+
+            if (!is_dir($temp_dir)) {
                 throw new Exception('Cannot create export directory: ' . $temp_dir);
             }
         }
@@ -210,6 +233,9 @@ class Custom_Migrator_Database_Exporter {
         // ENHANCED: Log temp file being used for better debugging
         $this->filesystem->log("Using temp file: " . basename($this->temp_file_path));
         
+        // SECURITY: final assertion that we only ever write inside the export directory.
+        $this->assert_safe_temp_file_path($temp_dir);
+
         $handle = fopen($this->temp_file_path, $mode);
         if (!$handle) {
             $error = error_get_last();
@@ -752,6 +778,9 @@ class Custom_Migrator_Database_Exporter {
             $this->filesystem->log("- Temp file size: " . $this->format_bytes($temp_size));
             
             $this->handle_compression($this->temp_file_path, $sql_file);
+
+            // The temp file is consumed; forget it so the next export never resumes onto it.
+            delete_option(self::TEMP_FILE_OPTION);
         } else {
             $this->filesystem->log("ERROR: Temp file does not exist: " . ($this->temp_file_path ? $this->temp_file_path : 'undefined'));
             throw new Exception("Temp file does not exist: " . ($this->temp_file_path ? basename($this->temp_file_path) : 'undefined'));
@@ -905,6 +934,35 @@ class Custom_Migrator_Database_Exporter {
         }
 
         return $success;
+    }
+
+    /**
+     * Check that a temp file name matches the names this class generates.
+     *
+     * @param string $name Base file name (no directory component).
+     * @return bool True if the name is one we could have produced.
+     */
+    private function is_valid_temp_file_name($name) {
+        return (bool) preg_match('/^db_export_temp_[A-Za-z0-9_.-]+\.sql$/', $name);
+    }
+
+    /**
+     * Refuse to write the SQL dump anywhere but the export directory.
+     *
+     * @param string $temp_dir Directory the temp file lives in.
+     * @throws Exception If the resolved path escapes the export directory.
+     */
+    private function assert_safe_temp_file_path($temp_dir) {
+        $export_dir = realpath($this->filesystem->get_export_dir());
+        $real_temp_dir = realpath($temp_dir);
+
+        if (!$export_dir || !$real_temp_dir || $real_temp_dir !== $export_dir) {
+            throw new Exception('Refusing to write SQL dump outside the export directory: ' . $temp_dir);
+        }
+
+        if (!$this->is_valid_temp_file_name(basename($this->temp_file_path))) {
+            throw new Exception('Refusing to write SQL dump to an unexpected file name: ' . basename($this->temp_file_path));
+        }
     }
 
     /**

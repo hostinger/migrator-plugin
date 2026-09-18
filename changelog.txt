@@ -1,0 +1,77 @@
+Changelog
+=========
+
+All notable changes to the Hostinger Migrator plugin are documented in this file.
+Versions before 1.1.0 predate this changelog and are not listed.
+
+
+1.1.0 - 2026-09-18
+------------------
+
+Security release. Upgrading is strongly recommended for every install.
+
+Security
+
+* Removed the wp_ajax_nopriv registrations for "cm_fallback_export" and
+  "cm_fallback_status". Both handlers ran a full database and file export and
+  were reachable by unauthenticated visitors. They now require the
+  manage_options capability and a valid nonce, checked before any filesystem
+  work is performed.
+* The database export no longer accepts a "temp_file_path" parameter from the
+  request. On resume, the temp file name is recovered from server-side state
+  and the directory is derived from the generated SQL file path, so the SQL
+  dump can no longer be steered to an arbitrary web-server-writable location.
+  A final check rejects any resolved path outside the export directory or with
+  an unexpected file name.
+* Removed the "background_mode" authentication bypass in "cm_run_export_now".
+  The flag was a plain request parameter, so any logged-in user could use it to
+  skip the capability and nonce checks and start a full export. Background
+  execution continues through the cm_run_export cron hook.
+* Gave "cm_process_export_step" a dedicated AJAX entry point with capability
+  and nonce checks. The underlying method no longer merges $_GET/$_POST into
+  its parameters and is now internal only.
+* Added the missing nonce check to plugin deletion ("cm_delete_plugin"), which
+  was CSRF-able into deleting the plugin and all export data.
+* Added a capability check to "cm_get_export_status_display" and
+  "cm_get_s3_status_display", which previously exposed migration status to any
+  logged-in user.
+* Sanitized the fallback export session id, which was taken from the request
+  unfiltered and written to the lock file and log.
+
+Changed
+
+* The export directory .htaccess is now default-deny with an allow list limited
+  to the randomly named export artifacts. Status, step, lock, content-list and
+  temporary SQL files are no longer served. The rules emit both Apache 2.2 and
+  2.4 authorization syntax so they neither silently no-op nor fail depending on
+  which authz module is loaded, and PHP execution is disabled for the
+  directory.
+* The export directory guard files (.htaccess, index.php) are now (re)written
+  whenever they are missing or out of date, instead of only when the directory
+  is first created. Existing installs are healed on the next admin page load.
+* All code paths that create the export directory now go through
+  Custom_Migrator_Filesystem::create_export_dir(). The fallback exporter and
+  the database exporter previously created it with a bare wp_mkdir_p(), which
+  produced a directory with no access protection at all.
+
+Fixed
+
+* The plugin header version (1.0) and CUSTOM_MIGRATOR_VERSION constant (1.0.0)
+  no longer disagree.
+
+Notes for hosting environments
+
+* The export directory protection relies on .htaccess, which Apache and
+  LiteSpeed honour but nginx ignores. On nginx the export artifacts are
+  protected only by the random component of their file names. Serving
+  downloads through an authenticated endpoint is tracked as follow-up work.
+
+Upgrade notes
+
+* Any external automation that called "cm_fallback_export",
+  "cm_fallback_status", "cm_run_export_now" or "cm_process_export_step" without
+  an authenticated session will stop working. These endpoints now require an
+  administrator session and a "custom_migrator_nonce" nonce.
+* Adds the "custom_migrator_db_temp_file" option, which holds the active
+  database export temp file name. It is cleared when an export finishes and
+  removed on uninstall.
