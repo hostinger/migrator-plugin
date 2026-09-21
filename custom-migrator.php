@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Hostinger Migrator
  * Description: Exports wp-content as a .hstgr file and the database as a separate .sql.gz file with metadata in .json
- * Version: 1.0
+ * Version: 1.1.0
  * Author: Your Name
  * License: GPL-2.0+
  * Text Domain: custom-migrator
@@ -16,7 +16,7 @@ if ( ! defined( 'WPINC' ) ) {
 }
 
 // Define plugin constants.
-define( 'CUSTOM_MIGRATOR_VERSION', '1.0.0' );
+define( 'CUSTOM_MIGRATOR_VERSION', '1.1.0' );
 define( 'CUSTOM_MIGRATOR_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'CUSTOM_MIGRATOR_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'CUSTOM_MIGRATOR_ADMIN_URL', admin_url( 'admin.php?page=custom-migrator' ) );

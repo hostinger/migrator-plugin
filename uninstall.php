@@ -19,6 +19,7 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 function custom_migrator_cleanup() {
     // Remove plugin options
     delete_option('custom_migrator_filenames');
+    delete_option('custom_migrator_db_temp_file');
     delete_option('custom_migrator_access_token');
     delete_option('custom_migrator_auth');
     delete_option('custom_migrator_export_subdir'); // If you kept this option
